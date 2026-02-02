@@ -70,7 +70,7 @@ use crate::bytecode::{
 };
 // Block type mismatch is now fixed - using unified Block from compile.rs
 use crate::parser::jq_parse;
-use crate::compile::compile;
+use crate::compile::{compile, count_cfunctions, jv_mem_alloc, jv_mem_calloc};
 use crate::types::Block;
 use crate::jv::jv_number_value;
 use crate::jv_aux::jv_keys;
@@ -248,29 +248,40 @@ pub fn jq_format_error(msg: Jv) -> Jv {
     }
 }
 /// Pop the current frame
-/// C: jq->curr_frame = stack_pop_block(&jq->stk, jq->curr_frame, frame_size(fp->bc));
+/// C: static void frame_pop(struct jq_state* jq)
 pub fn frame_pop<T>(jq: &mut JqState<T>) {
     // C: assert(jq->curr_frame);
     if jq.curr_frame == 0 {
         return;
     }
-    // Get frame size from the stack-based frame (like C does)
-    let frame_sz = if let Some(frame) = frame_current(jq) {
-        if let Some(ref bc) = frame.bc {
+
+    // C: struct frame* fp = frame_current(jq);
+    let (frame_sz, nlocals) = if let Some(frame) = frame_current(jq) {
+        let sz = if let Some(ref bc) = frame.bc {
             frame_size(bc.as_ref())
         } else {
             std::mem::size_of::<Frame>()
-        }
+        };
+        let nl = frame.bc.as_ref().map(|bc| bc.nlocals).unwrap_or(0);
+        (sz, nl)
     } else {
-        std::mem::size_of::<Frame>()
+        (std::mem::size_of::<Frame>(), 0)
     };
-    // C: if (stack_pop_will_free(&jq->stk, jq->curr_frame)) { free locals... }
-    // (skipping local cleanup for now)
 
-    // Also pop from frames vec if not empty (for compatibility with Rust code that uses it)
-    if !jq.frames.is_empty() {
-        jq.frames.pop();
+    // C: if (stack_pop_will_free(&jq->stk, jq->curr_frame)) {
+    //        int nlocals = fp->bc->nlocals;
+    //        for (int i=0; i<nlocals; i++) {
+    //            jv_free(*frame_local_var(jq, i, 0));
+    //        }
+    //    }
+    if crate::exec_stack::stack_pop_will_free(&jq.stk, jq.curr_frame) != 0 {
+        for i in 0..nlocals {
+            if let Some(var) = frame_local_var(jq, i as i32, 0) {
+                jv_free(std::mem::replace(var, jv_null()));
+            }
+        }
     }
+
     // C: jq->curr_frame = stack_pop_block(&jq->stk, jq->curr_frame, frame_size(fp->bc));
     jq.curr_frame = stack_pop_block(&mut jq.stk, jq.curr_frame, frame_sz as usize);
 }
@@ -356,16 +367,9 @@ pub fn stack_reset(s: &mut Stack) {
     stack_init(s);
 }
 /// Restore stack state and return the saved address
-/// Note: JqState doesn't have forkpoints/fork_top/stk_top fields
-/// This simplified version just handles frame cleanup
+/// C: uint16_t* stack_restore(jq_state *jq)
 pub fn stack_restore<T>(jq: &mut JqState<T>) -> Option<usize> {
-    // Pop frames until we're at the right level
-    while jq.frames.len() as StackPtr > jq.curr_frame + 1 {
-        frame_pop(jq);
-    }
-    // Without forkpoints, we can't restore to a saved state
-    // Return None to indicate no more backtracking possible
-    None
+    stack_restore_impl(jq)
 }
 /// Get current frame
 pub fn frame_current<T>(jq: &JqState<T>) -> Option<&Frame> {
@@ -386,18 +390,22 @@ pub fn frame_current_mut<T>(jq: &mut JqState<T>) -> Option<&mut Frame> {
     unsafe { block.as_mut() }
 }
 /// Get a local variable from a frame at given level
+/// C: static jv* frame_local_var(struct jq_state* jq, int var, int level)
 pub fn frame_local_var<T>(jq: &mut JqState<T>, var: i32, level: i32) -> Option<&mut Jv> {
-    let frame_idx = if level == 0 {
-        jq.frames.len().checked_sub(1)?
-    } else {
-        let target_level = jq.frames.len() as i32 - 1 - level;
-        if target_level < 0 {
-            return None;
-        }
-        target_level as usize
-    };
-    let frame = jq.frames.get_mut(frame_idx)?;
-    let var_idx = var as usize;
+    // C: struct frame* fr = stack_block(&jq->stk, frame_get_level(jq, level));
+    let fr_ptr = frame_get_level(jq, level);
+    let frame_ptr = unsafe { jq.stk.mem_end.offset(fr_ptr as isize) as *mut Frame };
+    let frame = unsafe { &mut *frame_ptr };
+
+    // C: assert(var >= 0);
+    if var < 0 {
+        return None;
+    }
+
+    // C: return &fr->entries[fr->bc->nclosures + var].localvar;
+    let nclosures = frame.bc.as_ref().map(|bc| bc.nclosures).unwrap_or(0) as usize;
+    let var_idx = nclosures + var as usize;
+
     if var_idx < frame.entries.len() {
         match &mut frame.entries[var_idx] {
             FrameEntry::LocalVar(jv) => Some(jv),
@@ -649,14 +657,21 @@ fn args2obj(args: Jv) -> Jv {
     r
 }
 /// Get frame at a specific level
+/// C: static stack_ptr frame_get_level(struct jq_state* jq, int level)
 pub fn frame_get_level<T>(jq: &JqState<T>, level: i32) -> StackPtr {
-    let mut fp_idx = jq.curr_frame as usize;
-    let mut current_level = level;
-    while current_level > 0 && fp_idx < jq.frames.len() {
-        fp_idx = jq.frames[fp_idx].env as usize;
-        current_level -= 1;
+    // C: stack_ptr fr = jq->curr_frame;
+    let mut fr = jq.curr_frame;
+    // C: for (int i=0; i<level; i++) {
+    for _ in 0..level {
+        // C: struct frame* fp = stack_block(&jq->stk, fr);
+        // Uses same pattern as frame_current()
+        let fp = unsafe { jq.stk.mem_end.offset(fr as isize) as *const Frame };
+        let frame = unsafe { &*fp };
+        // C: fr = fp->env;
+        fr = frame.env;
     }
-    fp_idx as StackPtr
+    // C: return fr;
+    fr
 }
 /// Dump disassembly for debugging
 pub fn jq_dump_disassembly<T>(jq: &JqState<T>, indent: i32) {
@@ -888,19 +903,34 @@ pub fn jq_get_input_cb<'a, T>(
     *data = jq.input_cb_data.as_deref();
 }
 /// Make a closure from bytecode
+/// C: static struct closure make_closure(struct jq_state* jq, uint16_t* pc)
 pub fn make_closure<T>(jq: &JqState<T>, pc: &[u16], pc_offset: &mut usize) -> Closure {
+    // C: uint16_t level = *pc++;
     let level = pc[*pc_offset] as i32;
     *pc_offset += 1;
+    // C: uint16_t idx = *pc++;
     let idx = pc[*pc_offset];
     *pc_offset += 1;
+    // C: stack_ptr fridx = frame_get_level(jq, level);
     let fridx = frame_get_level(jq, level);
-    if fridx as usize >= jq.frames.len() {
-        return Closure { bc: None, env: 0 };
-    }
-    let fr = &jq.frames[fridx as usize];
+    // C: struct frame* fr = stack_block(&jq->stk, fridx);
+    let fr_ptr = unsafe { jq.stk.mem_end.offset(fridx as isize) as *const Frame };
+    let fr = unsafe { &*fr_ptr };
+
+    // C: if (idx & ARG_NEWCLOSURE)
     if idx & 0x1000 != 0 {
+        // C: int subfn_idx = idx & ~ARG_NEWCLOSURE;
         let subfn_idx = (idx & !0x1000) as usize;
+        let debug = std::env::var("DEBUG_EXEC").is_ok();
+        if debug {
+            eprintln!("make_closure: subfunction reference, subfn_idx={}", subfn_idx);
+        }
+        // C: assert(subfn_idx < fr->bc->nsubfunctions);
+        // C: struct closure cl = {fr->bc->subfunctions[subfn_idx], fridx};
         if let Some(ref bc) = fr.bc {
+            if debug {
+                eprintln!("make_closure: bc.nsubfunctions={} bc.subfunctions.len={}", bc.nsubfunctions, bc.subfunctions.len());
+            }
             assert!(subfn_idx < bc.nsubfunctions as usize, "subfn_idx out of bounds");
             if subfn_idx < bc.subfunctions.len() {
                 return Closure {
@@ -908,9 +938,13 @@ pub fn make_closure<T>(jq: &JqState<T>, pc: &[u16], pc_offset: &mut usize) -> Cl
                     env: fridx,
                 };
             }
+        } else if debug {
+            eprintln!("make_closure: fr.bc is None");
         }
         Closure { bc: None, env: 0 }
     } else {
+        // C: int closure = idx;
+        // C: return fr->entries[closure].closure;
         let closure_idx = idx as usize;
         if let Some(ref bc) = fr.bc {
             assert!(closure_idx < bc.nclosures as usize, "closure out of bounds");
@@ -1101,8 +1135,16 @@ fn jq_compile_args_impl<T, J: JqStateAccess<T>>(jq: &mut J, program_str: &str, a
 
     // Compile the parsed program with builtins bound
     let mut bc = Bytecode::default();
+    // Initialize bc.globals similar to block_compile() in compile.c
+    let ncfunc = count_cfunctions(&program) as usize;
+    bc.globals = Some(jv_mem_alloc::<SymbolTable>());
+    if let Some(ref mut globals) = bc.globals {
+        globals.ncfunctions = 0;
+        globals.cfunctions = jv_mem_calloc(ncfunc);
+        globals.cfunc_names = Jv::array();
+    }
     let mut env: Option<Jv> = Some(Jv::object());
-    if debug { eprintln!("DEBUG: Compiling parsed program"); }
+    if debug { eprintln!("DEBUG: Compiling parsed program, ncfunc={}", ncfunc); }
     let compile_errors = compile(&mut bc, program, &mut locations, args, &mut env);
 
     if compile_errors > 0 {
@@ -1316,7 +1358,12 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                              const_idx, bc.constants.array_length());
                 }
                 let v = jv_array_get_bc(&bc.constants, const_idx);
-                if debug { eprintln!("EXEC PUSHK_UNDER: v.kind={:?} v.is_valid={}", jv_get_kind(&v), jv_is_valid(&v)); }
+                if debug {
+                    eprintln!("EXEC PUSHK_UNDER: v.kind={:?} v.is_valid={}", jv_get_kind(&v), jv_is_valid(&v));
+                    if jv_get_kind(&v) == JvKind::String {
+                        eprintln!("EXEC PUSHK_UNDER: string value=\"{}\"", crate::jv::jv_string_value(&v));
+                    }
+                }
                 if !jv_is_valid(&v) {
                     if debug { eprintln!("EXEC PUSHK_UNDER: constant is invalid!"); }
                     stack_push(jq_inner, jv_null());
@@ -1476,7 +1523,12 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                 if let Some(t) = stack_pop(jq_inner) {
                     if debug { eprintln!("EXEC INDEX: t.kind={:?}", jv_get_kind(&t)); }
                     if let Some(k) = stack_pop(jq_inner) {
-                        if debug { eprintln!("EXEC INDEX: k.kind={:?}", jv_get_kind(&k)); }
+                        if debug {
+                            eprintln!("EXEC INDEX: k.kind={:?}", jv_get_kind(&k));
+                            if jv_get_kind(&k) == JvKind::String {
+                                eprintln!("EXEC INDEX: k.string=\"{}\"", crate::jv::jv_string_value(&k));
+                            }
+                        }
                         // Check path integrity
                         if !path_intact(jq_inner, jv_copy(&t)) {
                             if debug { eprintln!("EXEC INDEX: path_intact failed"); }
@@ -1752,12 +1804,25 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             CALL_JQ | TAIL_CALL_JQ => {
+                let debug_call = std::env::var("DEBUG_EXEC").is_ok();
+                if debug_call {
+                    eprintln!("EXEC CALL_JQ: starting, pc_offset={}", pc_offset);
+                }
                 if let Some(input) = stack_pop(jq_inner) {
                     let nclosures = bc.code[pc_offset] as usize;
                     pc_offset += 1;
+                    if debug_call {
+                        eprintln!("EXEC CALL_JQ: nclosures={}", nclosures);
+                    }
 
                     // Get callee closure
                     let cl = make_closure_from_pc(jq_inner, &bc.code, &mut pc_offset);
+                    if debug_call {
+                        eprintln!("EXEC CALL_JQ: closure bc.is_some()={}", cl.bc.is_some());
+                        if let Some(ref bc) = cl.bc {
+                            eprintln!("EXEC CALL_JQ: closure bc.codelen={} constants.len={}", bc.codelen, bc.constants.array_length());
+                        }
+                    }
 
                     // Calculate return address
                     let retaddr = pc_offset + nclosures * 2;
@@ -1892,25 +1957,6 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                     path_append(jq_inner, key, jv_copy(&value));
                     stack_push(jq_inner, value);
                 }
-            }
-
-            // FORK - save state for backtracking
-            FORK => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
-                if debug { eprintln!("EXEC FORK: saving state"); }
-                let spos = stack_get_pos(jq_inner);
-                stack_save(jq_inner, Some(pc_offset - 1), spos);
-                // Skip offset - will be used on backtrack
-                pc_offset += 1;
-            }
-
-            // ON_BACKTRACK(FORK) - use the offset
-            on_bt_fork if on_bt_fork == on_backtrack(FORK) => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
-                if debug { eprintln!("EXEC FORK backtrack"); }
-                let offset = bc.code[pc_offset] as usize;
-                pc_offset += 1;
-                pc_offset += offset;
             }
 
             CALL_BUILTIN => {
@@ -2057,17 +2103,114 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             PATH_BEGIN => {
-                jq_inner.path = jv_array();
-                jq_inner.subexp_nest = 0;
+                // C: jv v = stack_pop(jq);
+                if let Some(v) = stack_pop(jq_inner) {
+                    // C: stack_push(jq, jq->path);
+                    let old_path = std::mem::replace(&mut jq_inner.path, jv_null());
+                    stack_push(jq_inner, old_path);
+
+                    // C: stack_save(jq, pc - 1, stack_get_pos(jq));
+                    let spos = stack_get_pos(jq_inner);
+                    stack_save(jq_inner, Some(pc_offset - 1), spos);
+
+                    // C: stack_push(jq, jv_number(jq->subexp_nest));
+                    stack_push(jq_inner, Jv::number(jq_inner.subexp_nest as f64));
+
+                    // C: stack_push(jq, jq->value_at_path);
+                    let old_value_at_path = std::mem::replace(&mut jq_inner.value_at_path, jv_null());
+                    stack_push(jq_inner, old_value_at_path);
+
+                    // C: stack_push(jq, jv_copy(v));
+                    stack_push(jq_inner, jv_copy(&v));
+
+                    // C: jq->path = jv_array();
+                    jq_inner.path = jv_array();
+
+                    // C: jq->value_at_path = v;
+                    jq_inner.value_at_path = v;
+
+                    // C: jq->subexp_nest = 0;
+                    jq_inner.subexp_nest = 0;
+                }
             }
 
             PATH_END => {
-                let path = std::mem::replace(&mut jq_inner.path, Jv::invalid());
-                if path.is_valid() {
-                    if let Some(_val) = stack_pop(jq_inner) {
-                        stack_push(jq_inner, path);
-                    } else {
-                        jv_free(path);
+                // C: jv v = stack_pop(jq);
+                if let Some(v) = stack_pop(jq_inner) {
+                    // C: if (!path_intact(jq, jv_copy(v))) { ... error ... }
+                    if !path_intact(jq_inner, jv_copy(&v)) {
+                        set_error_jq(jq_inner, jv_invalid_with_msg(
+                            Jv::string("Invalid path expression with result"),
+                        ));
+                        jv_free(v);
+                        match stack_restore_impl(jq_inner) {
+                            Some(offset) => {
+                                pc_offset = offset;
+                                backtracking = true;
+                                continue;
+                            }
+                            None => {
+                                if !jv_is_valid(&jq_inner.error) {
+                                    let error = std::mem::replace(&mut jq_inner.error, jv_null());
+                                    return error;
+                                }
+                                return Jv::invalid();
+                            }
+                        }
+                    }
+                    // C: jv_free(v); // discard value, only keep path
+                    jv_free(v);
+
+                    // C: jv old_value_at_path = stack_pop(jq);
+                    let old_value_at_path = stack_pop(jq_inner).unwrap_or_else(jv_null);
+
+                    // C: int old_subexp_nest = (int)jv_number_value(stack_pop(jq));
+                    let old_subexp_nest_jv = stack_pop(jq_inner).unwrap_or_else(|| Jv::number(0.0));
+                    let old_subexp_nest = jv_number_value(&old_subexp_nest_jv) as i32;
+                    jv_free(old_subexp_nest_jv);
+
+                    // C: jv path = jq->path;
+                    // C: jq->path = stack_pop(jq);
+                    let path = std::mem::replace(&mut jq_inner.path, jv_null());
+                    jq_inner.path = stack_pop(jq_inner).unwrap_or_else(jv_null);
+
+                    // C: struct stack_pos spos = stack_get_pos(jq);
+                    // C: stack_push(jq, jv_copy(path));
+                    // C: stack_save(jq, pc - 1, spos);
+                    let spos = stack_get_pos(jq_inner);
+                    stack_push(jq_inner, jv_copy(&path));
+                    stack_save(jq_inner, Some(pc_offset - 1), spos);
+
+                    // C: stack_push(jq, path);
+                    stack_push(jq_inner, path);
+
+                    // C: jq->subexp_nest = old_subexp_nest;
+                    jq_inner.subexp_nest = old_subexp_nest;
+
+                    // C: jv_free(jq->value_at_path);
+                    // C: jq->value_at_path = old_value_at_path;
+                    jv_free(std::mem::replace(&mut jq_inner.value_at_path, old_value_at_path));
+                }
+            }
+
+            // ON_BACKTRACK(PATH_BEGIN) and ON_BACKTRACK(PATH_END)
+            op if op == on_backtrack(PATH_BEGIN) || op == on_backtrack(PATH_END) => {
+                // C: jv_free(jq->path);
+                // C: jq->path = stack_pop(jq);
+                // C: goto do_backtrack;
+                jv_free(std::mem::replace(&mut jq_inner.path, jv_null()));
+                jq_inner.path = stack_pop(jq_inner).unwrap_or_else(jv_null);
+                match stack_restore_impl(jq_inner) {
+                    Some(offset) => {
+                        pc_offset = offset;
+                        backtracking = true;
+                    }
+                    None => {
+                        if !jv_is_valid(&jq_inner.error) {
+                            let error = std::mem::replace(&mut jq_inner.error, jv_null());
+                            return error;
+                        }
+                        return Jv::invalid();
                     }
                 }
             }
@@ -2533,6 +2676,84 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             }
             arr
         }
+        // Binary arithmetic operators
+        // C: These are implemented as cfunctions with nargs=3 (input, a, b)
+        "_plus" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_plus(a, b)
+        }
+        "_minus" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_minus(a, b)
+        }
+        "_multiply" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_multiply(a, b)
+        }
+        "_divide" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_divide(a, b)
+        }
+        "_mod" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_mod(a, b)
+        }
+        "_equal" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_equal(a, b)
+        }
+        "_notequal" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_notequal(a, b)
+        }
+        "_less" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_less(a, b)
+        }
+        "_greater" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_greater(a, b)
+        }
+        "_lesseq" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_lesseq(a, b)
+        }
+        "_greatereq" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            crate::builtin::binop_greatereq(a, b)
+        }
+        "_negate" => {
+            // Unary negation - negates the input directly (nargs=1 means just input)
+            if input.get_kind() == JvKind::Number {
+                let ret = Jv::number(-input.number_value());
+                jv_free(input);
+                ret
+            } else {
+                crate::builtin::type_error(input, "cannot be negated")
+            }
+        }
         _ => {
             // Unknown builtin - return input unchanged (passthrough)
             // This handles user-defined functions that get called as builtins
@@ -2659,32 +2880,51 @@ fn jv_invalid_get_msg(v: Jv) -> Jv {
 }
 
 /// Make closure from bytecode pc
+/// C: static struct closure make_closure(struct jq_state* jq, uint16_t* pc)
 fn make_closure_from_pc<T>(jq: &JqState<T>, code: &[u16], pc_offset: &mut usize) -> Closure {
+    let debug = std::env::var("DEBUG_EXEC").is_ok();
+    // C: uint16_t level = *pc++;
     let level = code[*pc_offset] as i32;
     *pc_offset += 1;
+    // C: uint16_t idx = *pc++;
     let idx = code[*pc_offset];
     *pc_offset += 1;
-
-    let fridx = frame_get_level(jq, level);
-    if fridx as usize >= jq.frames.len() {
-        return Closure { bc: None, env: 0 };
+    if debug {
+        eprintln!("make_closure_from_pc: level={} idx={} (0x{:x})", level, idx, idx);
     }
 
-    let fr = &jq.frames[fridx as usize];
+    // C: stack_ptr fridx = frame_get_level(jq, level);
+    let fridx = frame_get_level(jq, level);
+    // C: struct frame* fr = stack_block(&jq->stk, fridx);
+    let fr_ptr = unsafe { jq.stk.mem_end.offset(fridx as isize) as *const Frame };
+    let fr = unsafe { &*fr_ptr };
+
+    // C: if (idx & ARG_NEWCLOSURE)
     if idx & ARG_NEWCLOSURE != 0 {
-        // New closure
+        // C: int subfn_idx = idx & ~ARG_NEWCLOSURE;
         let subfn_idx = (idx & !ARG_NEWCLOSURE) as usize;
+        if debug {
+            eprintln!("make_closure_from_pc: new closure, subfn_idx={}", subfn_idx);
+        }
+        // C: assert(subfn_idx < fr->bc->nsubfunctions);
+        // C: struct closure cl = {fr->bc->subfunctions[subfn_idx], fridx};
         if let Some(ref bc) = fr.bc {
+            if debug {
+                eprintln!("make_closure_from_pc: bc.nsubfunctions={} bc.subfunctions.len={}", bc.nsubfunctions, bc.subfunctions.len());
+            }
             if subfn_idx < bc.subfunctions.len() {
                 return Closure {
                     bc: Some(bc.subfunctions[subfn_idx].clone()),
                     env: fridx,
                 };
             }
+        } else if debug {
+            eprintln!("make_closure_from_pc: fr.bc is None");
         }
         Closure { bc: None, env: 0 }
     } else {
-        // Reference to existing closure
+        // C: int closure = idx;
+        // C: return fr->entries[closure].closure;
         let closure_idx = idx as usize;
         if closure_idx < fr.entries.len() {
             if let FrameEntry::Closure(ref cl) = fr.entries[closure_idx] {
@@ -2711,13 +2951,21 @@ fn bytecode_operation_length_at(code: &[u16], offset: usize) -> usize {
 /// JQ debug trace flag
 pub const JQ_DEBUG_TRACE_ALL: i32 = 1;
 /// Get mutable frame at a specific level
+/// Similar to frame_get_level but returns mutable reference
 pub fn frame_get_level_mut<T>(jq: &mut JqState<T>, level: i32) -> Option<&mut Frame> {
     if level < 0 {
         return None;
     }
-    let len = jq.frames.len();
-    let idx = len.checked_sub(1 + level as usize)?;
-    jq.frames.get_mut(idx)
+    // Get frame stack pointer using same logic as frame_get_level
+    let mut fr = jq.curr_frame;
+    for _ in 0..level {
+        let fp = unsafe { jq.stk.mem_end.offset(fr as isize) as *const Frame };
+        let frame = unsafe { &*fp };
+        fr = frame.env;
+    }
+    // Return mutable reference to frame at fr
+    let frame_ptr = unsafe { jq.stk.mem_end.offset(fr as isize) as *mut Frame };
+    unsafe { frame_ptr.as_mut() }
 }
 /// Push a new frame
 pub fn frame_push<T>(jq: &mut JqState<T>, cl: Closure, _nargs: i32) -> StackPtr {

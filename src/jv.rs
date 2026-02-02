@@ -310,10 +310,10 @@ pub fn jvp_string_copy_replace_bad(data: &[u8]) -> Jv {
 /// Create a string Jv from sized data
 pub fn jv_string_sized(str_data: &str, len: usize) -> Jv {
     let data = str_data.chars().take(len).collect::<String>();
-    let hash = compute_string_hash(&data);
+    // Don't precompute hash - let jvp_string_hash_internal compute it lazily with MurmurHash3
     let payload = JvpString {
         refcnt: 1,
-        hash,
+        hash: 0,
         length: data.len() as i32,
         data,
     };
@@ -502,6 +502,7 @@ pub fn jv_object_set(mut j: Jv, key: Jv, val: Jv) -> Jv {
             value: val,
         };
         obj.elements.push(new_slot);
+        obj.next_free += 1;
     }
     j
 }
@@ -535,6 +536,7 @@ pub fn jvp_object_write<'a>(object: &'a mut Jv, key: &Jv) -> Option<&'a mut Jv> 
         string: jv_copy(key),
         value: Jv::default(),
     });
+    obj.next_free += 1;
 
     Some(&mut obj.elements[new_idx].value)
 }
@@ -987,7 +989,7 @@ pub fn jv_string(s: &str) -> Jv {
 pub fn jv_object() -> Jv {
     let obj = JvpObject {
         refcnt: 1,
-        next_free: -1,
+        next_free: 0,
         elements: Vec::new(),
     };
     let ptr = Box::into_raw(Box::new(obj));

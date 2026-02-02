@@ -236,10 +236,12 @@ pub struct Inst {
     pub compiled: Option<*mut Bytecode>,
 }
 
-impl Clone for Inst {
-    fn clone(&self) -> Self {
+impl Inst {
+    /// Raw clone that copies structure without remapping pointers.
+    /// Used internally by Block::clone to build complete tree before remapping.
+    fn clone_raw(&self) -> Self {
         Self {
-            next: self.next.clone(),
+            next: self.next.as_ref().map(|n| Box::new(n.clone_raw())),
             prev: self.prev,
             op: self.op,
             bytecode_pos: self.bytecode_pos,
@@ -249,14 +251,22 @@ impl Clone for Inst {
             referenced: self.referenced,
             nformals: self.nformals,
             nactuals: self.nactuals,
-            subfn: self.subfn.clone(),
-            arglist: self.arglist.clone(),
+            subfn: self.subfn.clone_raw(),
+            arglist: self.arglist.clone_raw(),
             source: self.source.clone(),
-            locfile: None, // Don't clone Locfile as it doesn't impl Clone
+            locfile: None,
             imm: self.imm.clone(),
             target: self.target,
             compiled: self.compiled,
         }
+    }
+}
+
+impl Clone for Inst {
+    fn clone(&self) -> Self {
+        // NOTE: This uses clone_raw. Block::clone handles remapping
+        // after building a complete ptr_map of the entire tree.
+        self.clone_raw()
     }
 }
 
@@ -291,14 +301,118 @@ pub struct Block {
     pub last: Option<*mut Inst>,
 }
 
+impl Block {
+    /// Raw clone that copies structure without remapping pointers.
+    /// Used internally by clone() and Inst::clone_raw().
+    fn clone_raw(&self) -> Self {
+        let first = self.first.as_ref().map(|f| Box::new(f.clone_raw()));
+        let last = if first.is_some() {
+            let mut curr = first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+            let mut last_ptr = curr;
+            while let Some(ptr) = curr {
+                last_ptr = curr;
+                unsafe {
+                    curr = (*ptr).next.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+                }
+            }
+            last_ptr
+        } else {
+            None
+        };
+        Block { first, last }
+    }
+}
+
 impl Clone for Block {
     fn clone(&self) -> Self {
-        // Clone the first instruction (which recursively clones the entire list)
-        let first = self.first.clone();
+        use std::collections::HashMap;
 
-        // Now we need to find the last instruction in the cloned list
+        // Phase 1: Raw clone - copies structure without remapping pointers
+        let first = self.first.as_ref().map(|f| Box::new(f.clone_raw()));
+
+        // Phase 2: Build COMPLETE ptr_map by recursively walking BOTH old and new trees
+        // This includes the main list AND all nested subfn AND all nested arglist
+        let mut ptr_map: HashMap<*const Inst, *mut Inst> = HashMap::new();
+
+        fn collect_mappings(
+            old_opt: &Option<Box<Inst>>,
+            new_opt: &Option<Box<Inst>>,
+            ptr_map: &mut HashMap<*const Inst, *mut Inst>,
+        ) {
+            let (Some(ref old_first), Some(ref new_first)) = (old_opt, new_opt) else {
+                return;
+            };
+            let mut old_curr: Option<&Inst> = Some(old_first.as_ref());
+            let mut new_curr: Option<&Inst> = Some(new_first.as_ref());
+
+            while let (Some(old_inst), Some(new_inst)) = (old_curr, new_curr) {
+                // Add this instruction to the map
+                ptr_map.insert(
+                    old_inst as *const Inst,
+                    new_inst as *const Inst as *mut Inst,
+                );
+
+                // Recurse into subfn
+                collect_mappings(&old_inst.subfn.first, &new_inst.subfn.first, ptr_map);
+
+                // Recurse into arglist
+                collect_mappings(&old_inst.arglist.first, &new_inst.arglist.first, ptr_map);
+
+                // Move to next instruction in list
+                old_curr = old_inst.next.as_ref().map(|b| b.as_ref());
+                new_curr = new_inst.next.as_ref().map(|b| b.as_ref());
+            }
+        }
+
+        collect_mappings(&self.first, &first, &mut ptr_map);
+
+        // Phase 3: Remap ALL pointers in the ENTIRE new tree (main + subfn + arglist)
+        fn remap_pointers(new_opt: &Option<Box<Inst>>, ptr_map: &HashMap<*const Inst, *mut Inst>) {
+            let Some(ref new_first) = new_opt else {
+                return;
+            };
+            let mut curr: Option<*mut Inst> = Some(new_first.as_ref() as *const Inst as *mut Inst);
+
+            while let Some(ptr) = curr {
+                unsafe {
+                    let inst = &mut *ptr;
+
+                    // Remap bound_by pointer
+                    if let Some(old_bound) = inst.bound_by {
+                        if let Some(&new_bound) = ptr_map.get(&(old_bound as *const Inst)) {
+                            inst.bound_by = Some(new_bound);
+                        }
+                    }
+
+                    // Remap prev pointer
+                    if let Some(old_prev) = inst.prev {
+                        if let Some(&new_prev) = ptr_map.get(&(old_prev as *const Inst)) {
+                            inst.prev = Some(new_prev);
+                        }
+                    }
+
+                    // Remap imm.target if it's a Target variant
+                    if let InstImmediate::Target(Some(old_target)) = inst.imm {
+                        if let Some(&new_target) = ptr_map.get(&(old_target as *const Inst)) {
+                            inst.imm = InstImmediate::Target(Some(new_target));
+                        }
+                    }
+
+                    // Recurse into subfn
+                    remap_pointers(&inst.subfn.first, ptr_map);
+
+                    // Recurse into arglist
+                    remap_pointers(&inst.arglist.first, ptr_map);
+
+                    curr = inst.next.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+                }
+            }
+        }
+
+        remap_pointers(&first, &ptr_map);
+
+        // Find the last instruction in the cloned list
         let last = if first.is_some() {
-            // Walk the cloned list to find the last element
             let mut curr = first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
             let mut last_ptr = curr;
             while let Some(ptr) = curr {
@@ -466,6 +580,18 @@ pub fn gen_op_bound(op: Opcode, binder: &Block) -> Block {
     }
     b
 }
+/// Generate an op bound to a binder via raw pointer
+/// Used when the binder Block will be moved later but we need to bind to it now
+fn gen_op_bound_to_ptr(op: Opcode, binder_ptr: Option<*mut Inst>) -> Block {
+    let binder_ptr = binder_ptr.expect("binder_ptr must be Some");
+    let symbol = unsafe { (*binder_ptr).symbol.as_ref().expect("symbol must exist").clone() };
+    let mut b = gen_op_unbound(op, &symbol);
+    if let Some(ref mut first) = b.first {
+        first.bound_by = Some(binder_ptr);
+        first.any_unbound = 0;
+    }
+    b
+}
 /// Generate a fresh variable operation
 pub fn gen_op_var_fresh(op: Opcode, name: &str) -> Block {
     let flags = get_opcode_flags_u16(op);
@@ -480,7 +606,8 @@ pub fn gen_op_var_fresh(op: Opcode, name: &str) -> Block {
     b
 }
 /// Generate an instruction with a branch target
-pub fn gen_op_target(op: Opcode, target: Block) -> Block {
+/// Note: Takes &Block to avoid consuming the target - caller must keep it alive
+pub fn gen_op_target(op: Opcode, target: &Block) -> Block {
     let op_desc = opcode_describe(op);
     assert!(
         (op_desc.flags & OP_HAS_BRANCH) != 0, "opcode_describe(op).flags & OP_HAS_BRANCH"
@@ -592,8 +719,8 @@ pub fn gen_try(exp: Block, mut handler: Block) -> Block {
         let pop = gen_op_simple(POP);
         handler = block_join(dup, pop);
     }
-    let jump = gen_op_target(JUMP, handler.clone());
-    let try_begin = gen_op_target(TRY_BEGIN, jump.clone());
+    let jump = gen_op_target(JUMP, &handler);
+    let try_begin = gen_op_target(TRY_BEGIN, &jump);
     let try_end = gen_op_simple(TRY_END);
     let try_body = block_join(try_begin, exp);
     let try_with_end = block_join(try_body, try_end);
@@ -635,8 +762,35 @@ pub fn gen_function(name: &str, mut formals: Block, mut body: Block) -> Block {
     i.nformals = nformals;
     i.arglist = formals;
     let mut b = inst_block(i);
-    let mut b_clone = b.clone();
-    block_bind_subblock(&mut b_clone, &mut b, OP_IS_CALL_PSEUDO | OP_HAS_BINDING, 0);
+
+    // Bind the CLOSURE_CREATE to itself and bind references in subfn/arglist.
+    // We use a raw pointer approach to avoid cloning (which would create dangling pointers
+    // when the clone is dropped).
+    if let Some(ref mut first) = b.first {
+        let binder_ptr = first.as_mut() as *mut Inst;
+        let binder_symbol = first.symbol.clone().unwrap_or_default();
+        let binder_nformals = first.nformals;
+
+        // Set self-binding: the CLOSURE_CREATE binds to itself
+        first.bound_by = Some(binder_ptr);
+
+        // Bind unbound references in subfn and arglist to this binder
+        let bindflags = OP_IS_CALL_PSEUDO | OP_HAS_BINDING;
+        block_bind_to_binder_ptr(
+            &mut first.subfn,
+            binder_ptr,
+            &binder_symbol,
+            binder_nformals,
+            bindflags,
+        );
+        block_bind_to_binder_ptr(
+            &mut first.arglist,
+            binder_ptr,
+            &binder_symbol,
+            binder_nformals,
+            bindflags,
+        );
+    }
     b
 }
 /// Generate a label expression
@@ -681,7 +835,7 @@ pub fn gen_reduce(source: Block, matcher: Block, init: Block, body: Block) -> Bl
         block_join(
             block_join(
                 block_join(block_join(gen_op_simple(DUP), init), res_var.clone()),
-                gen_op_target(FORK, loop_block.clone()),
+                gen_op_target(FORK, &loop_block),
             ),
             loop_block,
         ),
@@ -798,9 +952,9 @@ pub fn bind_alternation_matchers(
     let mut current = altmatchers.first.as_ref();
     while let Some(inst) = current {
         let submatcher = inst.subfn.clone();
-        let jump = gen_op_target(JUMP, final_matcher.clone());
+        let jump = gen_op_target(JUMP, &final_matcher);
         let submatcher = block_join(submatcher, jump);
-        let destruct_alt = gen_op_target(DESTRUCTURE_ALT, submatcher.clone());
+        let destruct_alt = gen_op_target(DESTRUCTURE_ALT, &submatcher);
         mb = block_join(mb, destruct_alt);
         mb = block_join(mb, submatcher);
         current = inst.next.as_ref();
@@ -855,7 +1009,7 @@ fn get_opcode_flags(op: CompileOpcode) -> i32 {
 /// Get opcode flags from u16 opcode
 fn get_opcode_flags_u16(op: Opcode) -> i32 {
     match op {
-        CLOSURE_PARAM => OP_HAS_BINDING | OP_HAS_VARIABLE,
+        CLOSURE_PARAM | CLOSURE_PARAM_REGULAR => OP_HAS_BINDING | OP_HAS_VARIABLE,
         CLOSURE_CREATE => OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
         CLOSURE_CREATE_C => OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
         JUMP => OP_HAS_BRANCH,
@@ -989,169 +1143,88 @@ pub const STOREVN: Opcode = CompileOpcode::STOREVN as u16;
 pub const DUPN: Opcode = CompileOpcode::DUPN as u16;
 pub const CLOSURE_PARAM_REGULAR: Opcode = CompileOpcode::CLOSURE_PARAM_REGULAR as u16;
 pub const INSERT: Opcode = CompileOpcode::INSERT as u16;
-/// Get opcode description
+pub const DUP2: Opcode = CompileOpcode::DUP2 as u16;
+pub const EACH: Opcode = CompileOpcode::EACH as u16;
+pub const EACH_OPT: Opcode = CompileOpcode::EACH_OPT as u16;
+pub const INDEX: Opcode = CompileOpcode::INDEX as u16;
+pub const INDEX_OPT: Opcode = CompileOpcode::INDEX_OPT as u16;
+pub const RANGE: Opcode = CompileOpcode::RANGE as u16;
+pub const PATH_BEGIN: Opcode = CompileOpcode::PATH_BEGIN as u16;
+pub const PATH_END: Opcode = CompileOpcode::PATH_END as u16;
+pub const GENLABEL: Opcode = CompileOpcode::GENLABEL as u16;
+pub const MODULEMETA: Opcode = CompileOpcode::MODULEMETA as u16;
+pub const PUSHK_UNDER: Opcode = CompileOpcode::PUSHK_UNDER as u16;
+pub const TAIL_CALL_JQ: Opcode = CompileOpcode::TAIL_CALL_JQ as u16;
+/// Get opcode description - matches C bytecode.c exactly
+/// Types from C: NONE=0,1  CONSTANT=OP_HAS_CONSTANT,2  VARIABLE=(OP_HAS_VARIABLE|OP_HAS_BINDING),3
+///               GLOBAL=(OP_HAS_CONSTANT|OP_HAS_VARIABLE|OP_HAS_BINDING|OP_IS_CALL_PSEUDO),4
+///               BRANCH=OP_HAS_BRANCH,2  CFUNC=(OP_HAS_CFUNC|OP_HAS_BINDING),3
+///               UFUNC=(OP_HAS_UFUNC|OP_HAS_BINDING|OP_IS_CALL_PSEUDO),4
+///               DEFINITION=(OP_IS_CALL_PSEUDO|OP_HAS_BINDING),0  CLOSURE_REF_IMM=same,2
 pub fn opcode_describe(op: Opcode) -> OpcodeDesc {
     match op {
-        LOADK => {
-            OpcodeDesc {
-                op,
-                name: "LOADK",
-                flags: OP_HAS_CONSTANT,
-                length: 2,
-            }
-        }
-        PUSHK_UNDER => {
-            OpcodeDesc {
-                op,
-                name: "PUSHK_UNDER",
-                flags: OP_HAS_CONSTANT,
-                length: 2,
-            }
-        }
-        LOADV => {
-            OpcodeDesc {
-                op,
-                name: "LOADV",
-                flags: OP_HAS_BINDING | OP_HAS_VARIABLE,
-                length: 2,
-            }
-        }
-        LOADVN => {
-            OpcodeDesc {
-                op,
-                name: "LOADVN",
-                flags: OP_HAS_BINDING | OP_HAS_VARIABLE,
-                length: 2,
-            }
-        }
-        STOREV => {
-            OpcodeDesc {
-                op,
-                name: "STOREV",
-                flags: OP_HAS_BINDING | OP_HAS_VARIABLE,
-                length: 2,
-            }
-        }
-        STOREVN => {
-            OpcodeDesc {
-                op,
-                name: "STOREVN",
-                flags: OP_HAS_BINDING | OP_HAS_VARIABLE,
-                length: 2,
-            }
-        }
-        DUP => {
-            OpcodeDesc {
-                op,
-                name: "DUP",
-                flags: 0,
-                length: 1,
-            }
-        }
-        POP => {
-            OpcodeDesc {
-                op,
-                name: "POP",
-                flags: 0,
-                length: 1,
-            }
-        }
-        FORK => {
-            OpcodeDesc {
-                op,
-                name: "FORK",
-                flags: OP_HAS_BRANCH,
-                length: 2,
-            }
-        }
-        JUMP => {
-            OpcodeDesc {
-                op,
-                name: "JUMP",
-                flags: OP_HAS_BRANCH,
-                length: 2,
-            }
-        }
-        JUMP_F => {
-            OpcodeDesc {
-                op,
-                name: "JUMP_F",
-                flags: OP_HAS_BRANCH,
-                length: 2,
-            }
-        }
-        BACKTRACK => {
-            OpcodeDesc {
-                op,
-                name: "BACKTRACK",
-                flags: 0,
-                length: 1,
-            }
-        }
-        APPEND => {
-            OpcodeDesc {
-                op,
-                name: "APPEND",
-                flags: OP_HAS_BINDING,
-                length: 2,
-            }
-        }
-        CALL_JQ => {
-            OpcodeDesc {
-                op,
-                name: "CALL_JQ",
-                flags: OP_HAS_UFUNC | OP_HAS_BINDING | OP_IS_CALL_PSEUDO,
-                length: 4,
-            }
-        }
-        CALL_BUILTIN => {
-            OpcodeDesc {
-                op,
-                name: "CALL_BUILTIN",
-                flags: 0,
-                length: 3,
-            }
-        }
-        CLOSURE_CREATE => {
-            OpcodeDesc {
-                op,
-                name: "CLOSURE_CREATE",
-                flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
-                length: 0,  // Function definition pseudo-op, doesn't emit bytecode
-            }
-        }
-        CLOSURE_PARAM => {
-            OpcodeDesc {
-                op,
-                name: "CLOSURE_PARAM",
-                flags: OP_IS_CALL_PSEUDO,
-                length: 0,  // Parameter definition pseudo-op, doesn't emit bytecode
-            }
-        }
-        CLOSURE_REF => {
-            OpcodeDesc {
-                op,
-                name: "CLOSURE_REF",
-                flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
-                length: 2,  // Has CLOSURE_REF_IMM type
-            }
-        }
-        CLOSURE_CREATE_C => {
-            OpcodeDesc {
-                op,
-                name: "CLOSURE_CREATE_C",
-                flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
-                length: 0,  // C builtin definition pseudo-op, doesn't emit bytecode
-            }
-        }
-        _ => {
-            OpcodeDesc {
-                op,
-                name: "UNKNOWN",
-                flags: 0,
-                length: 1,
-            }
-        }
+        // CONSTANT type: OP_HAS_CONSTANT, length 2
+        LOADK => OpcodeDesc { op, name: "LOADK", flags: OP_HAS_CONSTANT, length: 2 },
+        PUSHK_UNDER => OpcodeDesc { op, name: "PUSHK_UNDER", flags: OP_HAS_CONSTANT, length: 2 },
+        DEPS => OpcodeDesc { op, name: "DEPS", flags: OP_HAS_CONSTANT, length: 2 },
+        MODULEMETA => OpcodeDesc { op, name: "MODULEMETA", flags: OP_HAS_CONSTANT, length: 2 },
+        ERRORK => OpcodeDesc { op, name: "ERRORK", flags: OP_HAS_CONSTANT, length: 2 },
+
+        // VARIABLE type: OP_HAS_VARIABLE | OP_HAS_BINDING, length 3
+        LOADV => OpcodeDesc { op, name: "LOADV", flags: OP_HAS_VARIABLE | OP_HAS_BINDING, length: 3 },
+        LOADVN => OpcodeDesc { op, name: "LOADVN", flags: OP_HAS_VARIABLE | OP_HAS_BINDING, length: 3 },
+        STOREV => OpcodeDesc { op, name: "STOREV", flags: OP_HAS_VARIABLE | OP_HAS_BINDING, length: 3 },
+        STOREVN => OpcodeDesc { op, name: "STOREVN", flags: OP_HAS_VARIABLE | OP_HAS_BINDING, length: 3 },
+        APPEND => OpcodeDesc { op, name: "APPEND", flags: OP_HAS_VARIABLE | OP_HAS_BINDING, length: 3 },
+        RANGE => OpcodeDesc { op, name: "RANGE", flags: OP_HAS_VARIABLE | OP_HAS_BINDING, length: 3 },
+
+        // GLOBAL type: OP_HAS_CONSTANT | OP_HAS_VARIABLE | OP_HAS_BINDING | OP_IS_CALL_PSEUDO, length 4
+        STORE_GLOBAL => OpcodeDesc { op, name: "STORE_GLOBAL", flags: OP_HAS_CONSTANT | OP_HAS_VARIABLE | OP_HAS_BINDING | OP_IS_CALL_PSEUDO, length: 4 },
+
+        // BRANCH type: OP_HAS_BRANCH, length 2
+        FORK => OpcodeDesc { op, name: "FORK", flags: OP_HAS_BRANCH, length: 2 },
+        TRY_BEGIN => OpcodeDesc { op, name: "TRY_BEGIN", flags: OP_HAS_BRANCH, length: 2 },
+        JUMP => OpcodeDesc { op, name: "JUMP", flags: OP_HAS_BRANCH, length: 2 },
+        JUMP_F => OpcodeDesc { op, name: "JUMP_F", flags: OP_HAS_BRANCH, length: 2 },
+        DESTRUCTURE_ALT => OpcodeDesc { op, name: "DESTRUCTURE_ALT", flags: OP_HAS_BRANCH, length: 2 },
+
+        // CFUNC type: OP_HAS_CFUNC | OP_HAS_BINDING, length 3
+        CALL_BUILTIN => OpcodeDesc { op, name: "CALL_BUILTIN", flags: OP_HAS_CFUNC | OP_HAS_BINDING, length: 3 },
+
+        // UFUNC type: OP_HAS_UFUNC | OP_HAS_BINDING | OP_IS_CALL_PSEUDO, length 4
+        CALL_JQ => OpcodeDesc { op, name: "CALL_JQ", flags: OP_HAS_UFUNC | OP_HAS_BINDING | OP_IS_CALL_PSEUDO, length: 4 },
+        TAIL_CALL_JQ => OpcodeDesc { op, name: "TAIL_CALL_JQ", flags: OP_HAS_UFUNC | OP_HAS_BINDING | OP_IS_CALL_PSEUDO, length: 4 },
+
+        // DEFINITION type: OP_IS_CALL_PSEUDO | OP_HAS_BINDING, length 0
+        CLOSURE_PARAM => OpcodeDesc { op, name: "CLOSURE_PARAM", flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING, length: 0 },
+        CLOSURE_CREATE => OpcodeDesc { op, name: "CLOSURE_CREATE", flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING, length: 0 },
+        CLOSURE_CREATE_C => OpcodeDesc { op, name: "CLOSURE_CREATE_C", flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING, length: 0 },
+        CLOSURE_PARAM_REGULAR => OpcodeDesc { op, name: "CLOSURE_PARAM_REGULAR", flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING, length: 0 },
+
+        // CLOSURE_REF_IMM type: OP_IS_CALL_PSEUDO | OP_HAS_BINDING, length 2
+        CLOSURE_REF => OpcodeDesc { op, name: "CLOSURE_REF", flags: OP_IS_CALL_PSEUDO | OP_HAS_BINDING, length: 2 },
+
+        // NONE type: 0, length 1
+        DUP => OpcodeDesc { op, name: "DUP", flags: 0, length: 1 },
+        DUPN => OpcodeDesc { op, name: "DUPN", flags: 0, length: 1 },
+        DUP2 => OpcodeDesc { op, name: "DUP2", flags: 0, length: 1 },
+        POP => OpcodeDesc { op, name: "POP", flags: 0, length: 1 },
+        INDEX => OpcodeDesc { op, name: "INDEX", flags: 0, length: 1 },
+        INDEX_OPT => OpcodeDesc { op, name: "INDEX_OPT", flags: 0, length: 1 },
+        EACH => OpcodeDesc { op, name: "EACH", flags: 0, length: 1 },
+        EACH_OPT => OpcodeDesc { op, name: "EACH_OPT", flags: 0, length: 1 },
+        TRY_END => OpcodeDesc { op, name: "TRY_END", flags: 0, length: 1 },
+        BACKTRACK => OpcodeDesc { op, name: "BACKTRACK", flags: 0, length: 1 },
+        INSERT => OpcodeDesc { op, name: "INSERT", flags: 0, length: 1 },
+        SUBEXP_BEGIN => OpcodeDesc { op, name: "SUBEXP_BEGIN", flags: 0, length: 1 },
+        SUBEXP_END => OpcodeDesc { op, name: "SUBEXP_END", flags: 0, length: 1 },
+        PATH_BEGIN => OpcodeDesc { op, name: "PATH_BEGIN", flags: 0, length: 1 },
+        PATH_END => OpcodeDesc { op, name: "PATH_END", flags: 0, length: 1 },
+        RET => OpcodeDesc { op, name: "RET", flags: 0, length: 1 },
+        TOP => OpcodeDesc { op, name: "TOP", flags: 0, length: 1 },
+        GENLABEL => OpcodeDesc { op, name: "GENLABEL", flags: 0, length: 1 },
+
+        _ => OpcodeDesc { op, name: "UNKNOWN", flags: 0, length: 1 },
     }
 }
 pub fn locfile_locate(locfile: &Option<Box<Locfile>>, source: &Location, fmt: &str) {
@@ -1457,7 +1530,7 @@ pub fn gen_definedor(a: Block, b: Block) -> Block {
                         gen_op_simple(DUP),
                         gen_op_bound(LOADV, &found_var),
                     ),
-                    gen_op_target(JUMP_F, backtrack.clone()),
+                    gen_op_target(JUMP_F, &backtrack),
                 ),
                 backtrack.clone(),
             ),
@@ -1471,17 +1544,17 @@ pub fn gen_definedor(a: Block, b: Block) -> Block {
             block_join(gen_op_simple(DUP), gen_const(Jv::jv_true())),
             gen_op_bound(STOREV, &found_var),
         ),
-        gen_op_target(JUMP, tail.clone()),
+        gen_op_target(JUMP, &tail),
     );
     block_join(
         block_join(
             block_join(
                 block_join(
                     block_join(
-                        block_join(init, gen_op_target(FORK, if_notfound.clone())),
+                        block_join(init, gen_op_target(FORK, &if_notfound)),
                         a,
                     ),
-                    gen_op_target(JUMP_F, if_found.clone()),
+                    gen_op_target(JUMP_F, &if_found),
                 ),
                 if_found,
             ),
@@ -1532,26 +1605,37 @@ pub fn gen_collect(expr: Block) -> Block {
     if let Some(const_array) = gen_const_array(&expr) {
         return const_array;
     }
+    // Matches C: block array_var = gen_op_var_fresh(STOREV, "collect");
+    //            block c = BLOCK(gen_op_simple(DUP), gen_const(jv_array()), array_var);
+    //            block tail = BLOCK(gen_op_bound(APPEND, array_var), gen_op_simple(BACKTRACK));
+    //            return BLOCK(c, gen_op_target(FORK, tail), expr, tail, gen_op_bound(LOADVN, array_var));
+    // In C, array_var is used by value (shared pointers) everywhere.
+    // In Rust, we must use pointers to avoid cloning which breaks bound_by.
     let array_var = gen_op_var_fresh(STOREV, "collect");
+    let array_var_ptr = array_var.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+
+    // Create append and backtrack instructions, bound to array_var via pointer
+    let append = gen_op_bound_to_ptr(APPEND, array_var_ptr);
+    let tail = block_join(append, gen_op_simple(BACKTRACK));
+
+    // Create loadvn instruction, bound to array_var via pointer
+    let loadvn = gen_op_bound_to_ptr(LOADVN, array_var_ptr);
+
+    // Build: c = [DUP, const_array, array_var]
     let c = block_join(
         block_join(gen_op_simple(DUP), gen_const(jv_array())),
-        array_var.clone(),
+        array_var,  // array_var moved here, not cloned
     );
-    let tail = block_join(
-        gen_op_bound(APPEND, &array_var),
-        gen_op_simple(BACKTRACK),
-    );
+
+    // Build: [c, FORK->tail, expr, tail, loadvn]
     block_join(
         block_join(
-            block_join(block_join(c, gen_op_target(FORK, tail.clone())), expr),
+            block_join(block_join(c, gen_op_target(FORK, &tail)), expr),
             tail,
         ),
-        gen_op_bound(LOADVN, &array_var),
+        loadvn,
     )
 }
-pub const INDEX: Opcode = CompileOpcode::INSERT as u16;
-pub const MODULEMETA: Opcode = CompileOpcode::MODULEMETA as u16;
-pub const PUSHK_UNDER: Opcode = CompileOpcode::PUSHK_UNDER as u16;
 /// Bind each binder in a block to a body - matches C block_bind_each
 fn block_bind_each(binder: &Block, body: &mut Block, bindflags: i32) -> i32 {
     if !block_has_only_binders(binder, bindflags) {
@@ -1670,6 +1754,62 @@ pub fn block_bind_subblock_inner(
     }
     nrefs
 }
+
+/// Bind all matching unbound instructions in body to the given binder pointer.
+/// This avoids the need to clone when binding a block to itself (like in gen_function).
+/// Unlike block_bind_subblock_inner, this takes binder info as values rather than a Block ref.
+fn block_bind_to_binder_ptr(
+    body: &mut Block,
+    binder_ptr: *mut Inst,
+    binder_symbol: &str,
+    binder_nformals: i32,
+    bindflags: i32,
+) -> i32 {
+    let mut nrefs = 0;
+    let mut current = body.first.as_mut();
+    while let Some(inst) = current {
+        if inst.any_unbound == 0 {
+            current = inst.next.as_mut();
+            continue;
+        }
+        let flags = get_opcode_flags_u16(inst.op);
+        if (flags & bindflags) == (bindflags & !OP_BIND_WILDCARD)
+            && inst.bound_by.is_none()
+            && inst.symbol.is_some()
+        {
+            let inst_symbol = inst.symbol.as_ref().unwrap();
+            if inst_symbol == binder_symbol
+                && (inst.nactuals == -1 || inst.nactuals == binder_nformals)
+            {
+                inst.bound_by = Some(binder_ptr);
+                nrefs += 1;
+            }
+        }
+        inst.any_unbound = if inst.symbol.is_some() && inst.bound_by.is_none() {
+            1
+        } else {
+            0
+        };
+        // Recurse into subfn and arglist
+        nrefs += block_bind_to_binder_ptr(
+            &mut inst.subfn,
+            binder_ptr,
+            binder_symbol,
+            binder_nformals,
+            bindflags,
+        );
+        nrefs += block_bind_to_binder_ptr(
+            &mut inst.arglist,
+            binder_ptr,
+            binder_symbol,
+            binder_nformals,
+            bindflags,
+        );
+        current = inst.next.as_mut();
+    }
+    nrefs
+}
+
 /// Get the constant kind from a block
 pub fn block_const_kind(b: &Block) -> JvKind {
     if block_is_const(b) == 0 {
@@ -2040,9 +2180,6 @@ pub fn compile(
                 bc.nsubfunctions += 1;
             }
             if curr.op == CLOSURE_CREATE_C {
-                if debug_compile {
-                    eprintln!("  FIRST PASS: Found CLOSURE_CREATE_C at ptr={:p}, bc.globals.is_some()={}", ptr, bc.globals.is_some());
-                }
                 if let Some(bound_ptr) = curr.bound_by {
                     assert!(bound_ptr == ptr, "curr.bound_by == curr");
                 }
@@ -2061,9 +2198,6 @@ pub fn compile(
                         let _ = cfunc_ref; // Used for validation only
                     }
                     curr.imm = InstImmediate::IntVal(idx);
-                    if debug_compile {
-                        eprintln!("  FIRST PASS: Set CLOSURE_CREATE_C imm to IntVal({})", idx);
-                    }
                 }
             }
             curr_ptr = curr.next.as_mut().map(|b| b.as_mut() as *mut Inst);
@@ -2171,9 +2305,6 @@ pub fn compile(
                 );
                 if curr.op == CALL_BUILTIN {
                     if let Some(bound_ptr) = curr.bound_by {
-                        if debug_compile {
-                            eprintln!("  CODEGEN CALL_BUILTIN: bound_ptr={:p}", bound_ptr);
-                        }
                         assert!(
                             (* bound_ptr).op == CLOSURE_CREATE_C,
                             "curr.bound_by.op == CLOSURE_CREATE_C"
@@ -2553,7 +2684,7 @@ pub fn gen_foreach(
     let loop_block2 = gen_noop(); // placeholder - actual loop is already built
     let foreach1 = block_join(gen_op_simple(DUP), init);
     let foreach2 = block_join(foreach1, state_var);
-    let foreach3 = block_join(foreach2, gen_op_target(FORK, loop_block));
+    let foreach3 = block_join(foreach2, gen_op_target(FORK, &loop_block));
     let foreach4 = block_join(foreach3, loop_block2);
     let foreach = block_join(foreach4, gen_op_simple(BACKTRACK));
 
@@ -2794,14 +2925,24 @@ pub fn block_module_meta(b: &Block) -> Jv {
 }
 /// Generate a block that tries both alternatives
 pub fn gen_both(a: Block, b: Block) -> Block {
-    // Create two separate jump instructions since Block doesn't implement Clone
-    let jump1 = gen_op_targetlater(JUMP);
-    let jump2 = gen_op_targetlater(JUMP);
-    let fork = gen_op_target(FORK, jump1);
+    // Matches C: block jump = gen_op_targetlater(JUMP);
+    //            block fork = gen_op_target(FORK, jump);
+    //            block c = BLOCK(fork, a, jump, b);
+    //            inst_set_target(jump, c);
+    let jump = gen_op_targetlater(JUMP);
+    // Save pointer to jump instruction BEFORE joining it
+    let jump_ptr = jump.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+    let fork = gen_op_target(FORK, &jump);  // Pass reference, jump stays alive
     let mut c = block_join(fork, a);
-    c = block_join(c, jump2);
+    c = block_join(c, jump);  // jump is now part of c
     c = block_join(c, b);
-    // Note: inst_set_target simplified - targets are set during compilation
+    // Set jump's target to the end of c (after b)
+    // Matches C: b.first->imm.target = target.last (compile.c:210)
+    if let Some(ptr) = jump_ptr {
+        unsafe {
+            (*ptr).imm = InstImmediate::Target(c.last);
+        }
+    }
     c
 }
 fn jv_null() -> Jv {
