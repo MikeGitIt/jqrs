@@ -42,12 +42,8 @@ use crate::jv::{
     Jv, JvKind, jv_invalid_get_msg, jv_get_kind, jv_string_value,
     jv_null, jv_object, jv_string,
 };
-// Note: jv_is_valid, jv_copy, jv_free are defined locally as stubs
-// Note: gen_update, gen_format, yylex, jq_parse_library, yytnamerr, gen_definedor_assign,
-// yyerror, gen_slice_index, yysymbol_name, yydestruct, yyparse, gen_binop,
-// yypcontext_expected_tokens, yysyntax_error, gen_loc_object,
-// yy_syntax_error_arguments, gen_index, check_object_key, constant_fold, gen_index_opt
-// are all defined in this file
+use crate::jv_print::jv_dump_string_trunc;
+use crate::compile::{gen_dictpair, gen_const_object};
 use crate::types::*;
 use crate::types::{Locfile, LexerParam, YY_BUFFER_STATE};
 // Block and Inst are re-exported from compile.rs via types.rs
@@ -69,19 +65,6 @@ pub fn jv_kind_name(kind: JvKind) -> &'static str {
         JvKind::String => "string",
         JvKind::Array => "array",
         JvKind::Object => "object",
-    }
-}
-pub fn jv_dump_string_trunc(jv: &Jv, _buf: &mut [u8]) -> String {
-    // The Jv struct uses kind_flags to determine type, and u is a u64 storage
-    let kind = jv.kind_flags & 0x0F;
-    match kind {
-        1 => "null".to_string(),        // JvKind::Null
-        2 | 3 => "false/true".to_string(), // JvKind::False/True
-        4 => format!("{}", jv.u as f64), // JvKind::Number (simplified)
-        5 => "<string>".to_string(),    // JvKind::String
-        6 => "<array>".to_string(),     // JvKind::Array
-        7 => "<object>".to_string(),    // JvKind::Object
-        _ => "<value>".to_string(),
     }
 }
 /// Memory allocation error code
@@ -771,24 +754,17 @@ pub fn block_join(mut a: Block, mut b: Block) -> Block {
     }
 }
 /// Free a block's resources
-pub fn block_free(_block: Block) {}
+pub fn block_free(block: Block) {
+    crate::compile::block_free(block);
+}
 pub fn block_is_noop(b: &Block) -> bool {
     b.first.is_none()
 }
 pub fn block_is_single(b: &Block) -> bool {
-    // Since Inst struct is empty (no next field), assume single if first exists and last is None
-    b.first.is_some() && b.last.is_none()
+    crate::compile::block_is_single(b)
 }
 pub fn block_is_const(b: &Block) -> bool {
-    if !block_is_single(b) {
-        return false;
-    }
-    // Check if the instruction op is PushkUnder (indicates a constant)
-    if let Some(ref first) = b.first {
-        first.op == OpCode::PushkUnder as u16
-    } else {
-        false
-    }
+    crate::compile::block_is_const(b) != 0
 }
 pub fn block_const(b: &Block) -> Jv {
     // Extract the constant from the instruction's imm field
@@ -806,17 +782,10 @@ pub fn block_const_kind(b: &Block) -> JvKind {
 }
 /// Generate a no-operation block
 pub fn gen_noop() -> Block {
-    Block::default()
+    crate::compile::gen_noop()
 }
 pub fn gen_op_simple(op: OpCode) -> Block {
-    let mut inst = Inst::default();
-    inst.op = op as u16;
-    let boxed = Box::new(inst);
-    let ptr = Box::into_raw(boxed);
-    Block {
-        first: Some(unsafe { Box::from_raw(ptr) }),
-        last: Some(ptr),
-    }
+    crate::compile::gen_op_simple(op as u16)
 }
 pub fn gen_op_unbound(op: OpCode, name: &str) -> Block {
     crate::compile::gen_op_unbound(op as u16, name)
@@ -825,8 +794,7 @@ pub fn gen_const(jv: Jv) -> Block {
     crate::compile::gen_const(jv)
 }
 pub fn gen_error(msg: String) -> Block {
-    // Jv::invalid_with_msg expects a Jv, so wrap the string message
-    gen_const(Jv::invalid_with_msg(Jv::string(&msg)))
+    crate::compile::gen_error(Jv::string(&msg))
 }
 pub fn gen_subexp(a: Block) -> Block {
     crate::compile::gen_subexp(a)
@@ -837,92 +805,94 @@ pub fn gen_lambda(body: Block) -> Block {
 pub fn gen_call(name: &str, args: Block) -> Block {
     crate::compile::gen_call(name, args)
 }
-pub fn gen_location<T>(_loc: Location, _locations: &Locfile<T>, body: Block) -> Block {
-    // Inst struct is empty (no source field), just return the body unchanged
+pub fn gen_location<T>(loc: Location, _locations: &mut Locfile<T>, body: Block) -> Block {
+    // Set source location on all instructions in the block that don't have one yet
+    let mut curr_ptr = body.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+    while let Some(ptr) = curr_ptr {
+        unsafe {
+            let i = &mut *ptr;
+            if i.source.start == UNKNOWN_LOCATION.start && i.source.end == UNKNOWN_LOCATION.end {
+                i.source = loc;
+            }
+            curr_ptr = i.next.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+        }
+    }
     body
 }
-pub fn gen_module(_metadata: Block) -> Block {
-    gen_noop()
+pub fn gen_module(metadata: Block) -> Block {
+    crate::compile::gen_module(metadata)
 }
-pub fn gen_import(_path: &str, _alias: Option<&str>, _is_data: bool) -> Block {
-    gen_noop()
+pub fn gen_import(path: &str, alias: Option<&str>, is_data: bool) -> Block {
+    crate::compile::gen_import(path, alias, if is_data { 1 } else { 0 })
 }
-pub fn gen_import_meta(_import: Block, _meta: Block) -> Block {
-    gen_noop()
+pub fn gen_import_meta(import: Block, meta: Block) -> Block {
+    crate::compile::gen_import_meta(import, meta)
 }
-pub fn gen_function(_name: &str, _params: Block, _body: Block) -> Block {
-    gen_noop()
+pub fn gen_function(name: &str, params: Block, body: Block) -> Block {
+    crate::compile::gen_function(name, params, body)
 }
-pub fn gen_param(_name: &str) -> Block {
-    gen_noop()
+pub fn gen_param(name: &str) -> Block {
+    crate::compile::gen_param(name)
 }
-pub fn gen_param_regular(_name: &str) -> Block {
-    gen_noop()
+pub fn gen_param_regular(name: &str) -> Block {
+    crate::compile::gen_param_regular(name)
 }
 /// Generate a format expression block
-///
-/// Creates a block that applies a format to an expression.
 pub fn gen_format(a: Block, fmt: Jv) -> Block {
     let format_lambda = gen_lambda(gen_const(fmt));
     let format_call = gen_call("format", format_lambda);
     block_join(a, format_call)
 }
 pub fn gen_cond(cond: Block, then_block: Block, else_block: Block) -> Block {
-    block_join(block_join(cond, then_block), else_block)
+    crate::compile::gen_cond(cond, then_block, else_block)
 }
 pub fn gen_try(body: Block, handler: Block) -> Block {
-    block_join(body, handler)
+    crate::compile::gen_try(body, handler)
 }
-pub fn gen_label(_name: &str, body: Block) -> Block {
-    body
+pub fn gen_label(name: &str, body: Block) -> Block {
+    crate::compile::gen_label(name, body)
 }
 pub fn gen_or(a: Block, b: Block) -> Block {
-    block_join(a, b)
+    crate::compile::gen_or(a, b)
 }
 pub fn gen_and(a: Block, b: Block) -> Block {
-    block_join(a, b)
+    crate::compile::gen_and(a, b)
 }
 pub fn gen_definedor(a: Block, b: Block) -> Block {
-    block_join(a, b)
+    crate::compile::gen_definedor(a, b)
 }
 pub fn gen_both(a: Block, b: Block) -> Block {
-    block_join(a, b)
+    crate::compile::gen_both(a, b)
 }
 pub fn gen_collect(body: Block) -> Block {
-    body
+    crate::compile::gen_collect(body)
 }
-pub fn gen_reduce(_expr: Block, _var: Block, _init: Block, _update: Block) -> Block {
-    gen_noop()
+pub fn gen_reduce(expr: Block, var: Block, init: Block, update: Block) -> Block {
+    crate::compile::gen_reduce(expr, var, init, update)
 }
 pub fn gen_foreach(
-    _expr: Block,
-    _var: Block,
-    _init: Block,
-    _update: Block,
-    _extract: Block,
+    expr: Block,
+    var: Block,
+    init: Block,
+    update: Block,
+    extract: Block,
 ) -> Block {
-    gen_noop()
+    crate::compile::gen_foreach(expr, var, init, update, extract)
 }
-pub fn gen_destructure(_pattern: Block, _body: Block, _expr: Block) -> Block {
-    gen_noop()
+pub fn gen_destructure(pattern: Block, matchers: Block, body: Block) -> Block {
+    crate::compile::gen_destructure(pattern, matchers, body)
 }
 pub fn gen_destructure_alt(pattern: Block) -> Block {
-    pattern
+    crate::compile::gen_destructure_alt(pattern)
 }
 pub fn gen_array_matcher(arr: Block, elem: Block) -> Block {
-    block_join(arr, elem)
+    crate::compile::gen_array_matcher(arr, elem)
 }
 pub fn gen_object_matcher(key: Block, val: Block) -> Block {
-    block_join(key, val)
+    crate::compile::gen_object_matcher(key, val)
 }
-pub fn gen_dictpair(key: Block, val: Block) -> Block {
-    block_join(key, val)
-}
-pub fn gen_const_object(pairs: Block) -> Block {
-    pairs
-}
-pub fn block_bind_referenced(defs: Block, body: Block, _flags: i32) -> Block {
-    block_join(defs, body)
+pub fn block_bind_referenced(defs: Block, body: Block, flags: i32) -> Block {
+    crate::compile::block_bind_referenced(defs, body, flags)
 }
 /// Operation type constants - matching C jq bytecode.h
 pub const OP_IS_CALL_PSEUDO: i32 = 16;
@@ -959,21 +929,17 @@ pub fn gen_slice_index(obj: Block, start: Block, end: Block, idx_op: OpCode) -> 
     let result1 = block_join(gen_subexp(key), obj);
     block_join(result1, gen_op_simple(idx_op))
 }
-/// Generate an update expression block
-///
-/// Creates a block that performs an update operation on an object with a value
-/// using the specified operation type.
 pub fn gen_update(object: Block, val: Block, optype: i32) -> Block {
-    // Simplified implementation since Block doesn't implement Clone
-    // and DUP/STOREV/LOADV are Opcode not OpCode
-    let inner1 = block_join(gen_op_simple(OpCode::Dup), val);
-    let inner2 = block_join(inner1, gen_noop()); // Was tmp.clone()
-    let binop_block = gen_binop(gen_noop(), gen_noop(), optype); // Simplified
+    let tmp = crate::compile::gen_op_var_fresh(crate::compile::STOREV, "tmp");
+    let loadv_tmp = crate::compile::gen_op_bound(crate::compile::LOADV, &tmp);
+    let binop_block = gen_binop(gen_noop(), loadv_tmp, optype);
     let lambda2 = gen_lambda(binop_block);
     let lambda1 = gen_lambda(object);
     let call_args = block_join(lambda1, lambda2);
     let modify_call = gen_call("_modify", call_args);
-    block_join(inner2, modify_call)
+    let b1 = block_join(gen_op_simple(OpCode::Dup), val);
+    let b2 = block_join(b1, tmp);
+    block_join(b2, modify_call)
 }
 /// Generate location object for __loc__
 pub fn gen_loc_object<T>(loc: &Location, locations: &Locfile<T>) -> Block {
@@ -1001,14 +967,41 @@ pub fn locfile_get_line<T>(locations: &Locfile<T>, pos: i32) -> i32 {
     }
     (lo as i32).saturating_sub(1)
 }
-/// Constant folding for binary operations
-pub fn constant_fold(_a: Block, _b: Block, _op: i32) -> Block {
-    // Since block_is_const always returns false, we can't do constant folding
-    // Just return a noop block
-    gen_noop()
+pub fn constant_fold(a: Block, b: Block, op: i32) -> Block {
+    if !block_is_single(&a) || !block_is_const(&a) || !block_is_single(&b) || !block_is_const(&b) {
+        return gen_noop();
+    }
+    let jv_a = block_const(&a);
+    crate::compile::block_free(a);
+    let jv_b = block_const(&b);
+    crate::compile::block_free(b);
+    let res = match op as u8 {
+        b'+' => binop_plus(jv_a, jv_b),
+        b'-' => binop_minus(jv_a, jv_b),
+        b'*' => binop_multiply(jv_a, jv_b),
+        b'/' => binop_divide(jv_a, jv_b),
+        b'%' => binop_mod(jv_a, jv_b),
+        _ if op == EQ_TOKEN => binop_equal(jv_a, jv_b),
+        _ if op == NEQ_TOKEN => binop_notequal(jv_a, jv_b),
+        _ if (op as u8) == b'<' => binop_less(jv_a, jv_b),
+        _ if (op as u8) == b'>' => binop_greater(jv_a, jv_b),
+        _ if op == LEQ_TOKEN => binop_lesseq(jv_a, jv_b),
+        _ if op == GEQ_TOKEN => binop_greatereq(jv_a, jv_b),
+        _ => { jv_free(jv_a); jv_free(jv_b); return gen_noop(); }
+    };
+    if !jv_is_valid(&res) {
+        jv_free(res);
+        return gen_noop();
+    }
+    gen_const(res)
 }
-/// Generate binary operation
 pub fn gen_binop(a: Block, b: Block, op: i32) -> Block {
+    let folded = constant_fold(a.clone(), b.clone(), op);
+    if !block_is_noop(&folded) {
+        crate::compile::block_free(a);
+        crate::compile::block_free(b);
+        return folded;
+    }
     let funcname = match op as u8 {
         b'+' => "_plus",
         b'-' => "_minus",
@@ -1030,8 +1023,7 @@ pub fn check_object_key(k: &Block) -> Jv {
     if block_is_const(k) && block_const_kind(k) != JvKind::String {
         let kind = block_const_kind(k);
         let val = block_const(k);
-        let mut buf = [0u8; 15];
-        let truncated = jv_dump_string_trunc(&val, &mut buf);
+        let truncated = jv_dump_string_trunc(val, 15);
         return Jv::string_fmt(
             "Cannot use %s (%s) as object key",
             &[jv_kind_name(kind), &truncated],
@@ -1363,6 +1355,7 @@ pub fn yyparse<T>(
     locations: &mut Locfile<T>,
     lexer_param_ptr: &mut LexerParam,
 ) -> i32 {
+    let debug = std::env::var("DEBUG_PARSER").is_ok();
     let mut yychar: i32 = -2;
     let mut yylval = YYSType::default();
     let mut yylloc = Location::default();
@@ -1524,6 +1517,9 @@ pub fn yyparse<T>(
             }
         } else {
             if yychar == -2 {
+                if debug_parser {
+                    eprintln!("PARSER: about to call yylex");
+                }
                 yychar = yylex(
                     &mut yylval,
                     &mut yylloc,
@@ -1646,9 +1642,9 @@ pub fn yyparse<T>(
                     eprintln!("RULE 2: yyvs[{}] type = {:?}", yyvsp - 1, std::mem::discriminant(&yyvs[yyvsp - 1]));
                     eprintln!("RULE 2: yyvs[{}] type = {:?}", yyvsp, std::mem::discriminant(&yyvs[yyvsp]));
                 }
-                let module = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let imports = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let module = yyvs[yyvsp - 2].take_blk();
+                let imports = yyvs[yyvsp - 1].take_blk();
+                let exp = yyvs[yyvsp].take_blk();
                 if debug_parser {
                     eprintln!("RULE 2: module is_noop={}, imports is_noop={}, exp is_noop={}",
                              block_is_noop(&module), block_is_noop(&imports), block_is_noop(&exp));
@@ -1668,9 +1664,9 @@ pub fn yyparse<T>(
             }
             // case 3: TopLevel: Module Imports FuncDefs
             3 => {
-                let module = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let imports = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let funcdefs = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let module = yyvs[yyvsp - 2].take_blk();
+                let imports = yyvs[yyvsp - 1].take_blk();
+                let funcdefs = yyvs[yyvsp].take_blk();
                 *answer = block_join(block_join(module, imports), funcdefs);
             }
             // case 4: Module: %empty
@@ -1679,7 +1675,7 @@ pub fn yyparse<T>(
             }
             // case 5: Module: "module" Exp ';'
             5 => {
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 1].take_blk();
                 if !block_is_const(&exp) {
                     yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Module metadata must be constant");
                     yyval = YYSType::Blk(gen_noop());
@@ -1698,8 +1694,8 @@ pub fn yyparse<T>(
             }
             // case 7: Imports: Import Imports
             7 => {
-                let import = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let imports = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let import = yyvs[yyvsp - 1].take_blk();
+                let imports = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(import, imports));
             }
             // case 8: FuncDefs: %empty
@@ -1708,243 +1704,243 @@ pub fn yyparse<T>(
             }
             // case 9: FuncDefs: FuncDef FuncDefs
             9 => {
-                let funcdef = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let funcdefs = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let funcdef = yyvs[yyvsp - 1].take_blk();
+                let funcdefs = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(funcdef, funcdefs));
             }
             // case 10: Exp: FuncDef Exp
             10 => {
-                let funcdef = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let funcdef = yyvs[yyvsp - 1].take_blk();
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_bind_referenced(funcdef, exp, OP_IS_CALL_PSEUDO));
             }
             // case 11: Exp: Term "as" Patterns '|' Exp
             11 => {
-                let term = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
-                let patterns = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 4].take_blk();
+                let patterns = yyvs[yyvsp - 2].take_blk();
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_destructure(term, patterns, exp));
             }
             // case 12: Exp: "reduce" Term "as" Patterns '(' Exp ';' Exp ')'
             12 => {
-                let term = yyvs[yyvsp - 7].blk().cloned().unwrap_or_else(gen_noop);
-                let patterns = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let init = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let update = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 7].take_blk();
+                let patterns = yyvs[yyvsp - 5].take_blk();
+                let init = yyvs[yyvsp - 3].take_blk();
+                let update = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_reduce(term, patterns, init, update));
             }
             // case 13: Exp: "foreach" Term "as" Patterns '(' Exp ';' Exp ';' Exp ')'
             13 => {
-                let term = yyvs[yyvsp - 9].blk().cloned().unwrap_or_else(gen_noop);
-                let patterns = yyvs[yyvsp - 7].blk().cloned().unwrap_or_else(gen_noop);
-                let init = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let update = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let extract = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 9].take_blk();
+                let patterns = yyvs[yyvsp - 7].take_blk();
+                let init = yyvs[yyvsp - 5].take_blk();
+                let update = yyvs[yyvsp - 3].take_blk();
+                let extract = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_foreach(term, patterns, init, update, extract));
             }
             // case 14: Exp: "foreach" Term "as" Patterns '(' Exp ';' Exp ')'
             14 => {
-                let term = yyvs[yyvsp - 7].blk().cloned().unwrap_or_else(gen_noop);
-                let patterns = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let init = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let update = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 7].take_blk();
+                let patterns = yyvs[yyvsp - 5].take_blk();
+                let init = yyvs[yyvsp - 3].take_blk();
+                let update = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_foreach(term, patterns, init, update, gen_noop()));
             }
             // case 15: Exp: "if" Exp "then" Exp ElseBody
             15 => {
-                let cond = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let then_exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let else_body = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let cond = yyvs[yyvsp - 3].take_blk();
+                let then_exp = yyvs[yyvsp - 1].take_blk();
+                let else_body = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_cond(cond, then_exp, else_body));
             }
             // case 16: Exp: "if" Exp "then" error
             16 => {
                 yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Possibly unterminated 'if' statement");
-                let exp = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(exp);
             }
             // case 17: Exp: "try" Exp "catch" Exp
             17 => {
-                let try_exp = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let catch_exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let try_exp = yyvs[yyvsp - 2].take_blk();
+                let catch_exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_try(try_exp, catch_exp));
             }
             // case 18: Exp: "try" Exp
             18 => {
-                let try_exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let try_exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_try(try_exp, gen_op_simple(OpCode::Backtrack)));
             }
             // case 19: Exp: "try" Exp "catch" error
             19 => {
                 yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Possibly unterminated 'try' statement");
-                let exp = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(exp);
             }
             // case 20: Exp: "label" BINDING '|' Exp
             20 => {
                 let binding = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp].take_blk();
                 let label_name = format!("*label-{}", jv_string_value(&binding));
                 yyval = YYSType::Blk(gen_location(yyloc, locations, gen_label(&label_name, exp)));
                 jv_free(binding);
             }
             // case 21: Exp: Exp '?'
             21 => {
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_try(exp, gen_op_simple(OpCode::Backtrack)));
             }
             // case 22: Exp: Exp '=' Exp
             22 => {
-                let lhs = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let rhs = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let lhs = yyvs[yyvsp - 2].take_blk();
+                let rhs = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_call("_assign", block_join(gen_lambda(lhs), gen_lambda(rhs))));
             }
             // case 23: Exp: Exp "or" Exp
             23 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_or(a, b));
             }
             // case 24: Exp: Exp "and" Exp
             24 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_and(a, b));
             }
             // case 25: Exp: Exp "//" Exp
             25 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_definedor(a, b));
             }
             // case 26: Exp: Exp "//=" Exp
             26 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_definedor_assign(a, b));
             }
             // case 27: Exp: Exp "|=" Exp
             27 => {
-                let lhs = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let rhs = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let lhs = yyvs[yyvsp - 2].take_blk();
+                let rhs = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_call("_modify", block_join(gen_lambda(lhs), gen_lambda(rhs))));
             }
             // case 28: Exp: Exp '|' Exp
             28 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(a, b));
             }
             // case 29: Exp: Exp ',' Exp
             29 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_both(a, b));
             }
             // case 30: Exp: Exp '+' Exp
             30 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, '+' as i32));
             }
             // case 31: Exp: Exp "+=" Exp
             31 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_update(a, b, '+' as i32));
             }
             // case 32: Exp: '-' Exp
             32 => {
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(exp, gen_call("_negate", gen_noop())));
             }
             // case 33: Exp: Exp '-' Exp
             33 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, '-' as i32));
             }
             // case 34: Exp: Exp "-=" Exp
             34 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_update(a, b, '-' as i32));
             }
             // case 35: Exp: Exp '*' Exp
             35 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, '*' as i32));
             }
             // case 36: Exp: Exp "*=" Exp
             36 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_update(a, b, '*' as i32));
             }
             // case 37: Exp: Exp '/' Exp
             37 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, '/' as i32));
             }
             // case 38: Exp: Exp '%' Exp
             38 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, '%' as i32));
             }
             // case 39: Exp: Exp "/=" Exp
             39 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_update(a, b, '/' as i32));
             }
             // case 40: Exp: Exp "%=" Exp
             40 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_update(a, b, '%' as i32));
             }
             // case 41: Exp: Exp "==" Exp
             41 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, EQ_TOKEN));
             }
             // case 42: Exp: Exp "!=" Exp
             42 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, NEQ_TOKEN));
             }
             // case 43: Exp: Exp '<' Exp
             43 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, '<' as i32));
             }
             // case 44: Exp: Exp '>' Exp
             44 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, '>' as i32));
             }
             // case 45: Exp: Exp "<=" Exp
             45 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, LEQ_TOKEN));
             }
             // case 46: Exp: Exp ">=" Exp
             46 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_binop(a, b, GEQ_TOKEN));
             }
             // case 47: Exp: Term
             47 => {
-                let term = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp].take_blk();
                 if debug_parser {
                     eprintln!("RULE 47 (Exp: Term): term is_noop={}", block_is_noop(&term));
                 }
@@ -1952,13 +1948,13 @@ pub fn yyparse<T>(
             }
             // case 48: Import: ImportWhat ';'
             48 => {
-                let import_what = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let import_what = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(import_what);
             }
             // case 49: Import: ImportWhat Exp ';'
             49 => {
-                let import_what = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let import_what = yyvs[yyvsp - 2].take_blk();
+                let exp = yyvs[yyvsp - 1].take_blk();
                 if !block_is_const(&exp) {
                     yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Module metadata must be constant");
                     yyval = YYSType::Blk(gen_noop());
@@ -1975,7 +1971,7 @@ pub fn yyparse<T>(
             }
             // case 50: ImportWhat: "import" ImportFrom "as" BINDING
             50 => {
-                let import_from = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let import_from = yyvs[yyvsp - 2].take_blk();
                 let binding = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
                 let v = block_const(&import_from);
                 yyval = YYSType::Blk(gen_import(jv_string_value(&v), Some(jv_string_value(&binding)), true));
@@ -1985,7 +1981,7 @@ pub fn yyparse<T>(
             }
             // case 51: ImportWhat: "import" ImportFrom "as" IDENT
             51 => {
-                let import_from = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let import_from = yyvs[yyvsp - 2].take_blk();
                 let ident = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
                 let v = block_const(&import_from);
                 yyval = YYSType::Blk(gen_import(jv_string_value(&v), Some(jv_string_value(&ident)), false));
@@ -1995,7 +1991,7 @@ pub fn yyparse<T>(
             }
             // case 52: ImportWhat: "include" ImportFrom
             52 => {
-                let import_from = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let import_from = yyvs[yyvsp].take_blk();
                 let v = block_const(&import_from);
                 yyval = YYSType::Blk(gen_import(jv_string_value(&v), None, false));
                 block_free(import_from);
@@ -2003,7 +1999,7 @@ pub fn yyparse<T>(
             }
             // case 53: ImportFrom: String
             53 => {
-                let string = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let string = yyvs[yyvsp].take_blk();
                 if !block_is_const(&string) {
                     yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Import path must be constant");
                     yyval = YYSType::Blk(gen_const(jv_string("")));
@@ -2015,27 +2011,27 @@ pub fn yyparse<T>(
             // case 54: FuncDef: "def" IDENT ':' Exp ';'
             54 => {
                 let ident = yyvs[yyvsp - 3].literal().cloned().unwrap_or_else(Jv::null);
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_function(jv_string_value(&ident), gen_noop(), exp));
                 jv_free(ident);
             }
             // case 55: FuncDef: "def" IDENT '(' Params ')' ':' Exp ';'
             55 => {
                 let ident = yyvs[yyvsp - 6].literal().cloned().unwrap_or_else(Jv::null);
-                let params = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let params = yyvs[yyvsp - 4].take_blk();
+                let exp = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_function(jv_string_value(&ident), params, exp));
                 jv_free(ident);
             }
             // case 56: Params: Param
             56 => {
-                let param = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let param = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(param);
             }
             // case 57: Params: Params ';' Param
             57 => {
-                let params = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let param = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let params = yyvs[yyvsp - 2].take_blk();
+                let param = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(params, param));
             }
             // case 58: Param: BINDING
@@ -2061,7 +2057,7 @@ pub fn yyparse<T>(
             }
             // case 62: String: StringStart QQString QQSTRING_END
             62 => {
-                let qqstring = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let qqstring = yyvs[yyvsp - 1].take_blk();
                 let string_start = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
                 yyval = YYSType::Blk(qqstring);
                 jv_free(string_start);
@@ -2072,27 +2068,27 @@ pub fn yyparse<T>(
             }
             // case 64: QQString: QQString QQSTRING_TEXT
             64 => {
-                let qqstring = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let qqstring = yyvs[yyvsp - 1].take_blk();
                 let text = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
                 yyval = YYSType::Blk(gen_binop(qqstring, gen_const(text), '+' as i32));
             }
             // case 65: QQString: QQString QQSTRING_INTERP_START Exp QQSTRING_INTERP_END
             65 => {
-                let qqstring = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let qqstring = yyvs[yyvsp - 3].take_blk();
+                let exp = yyvs[yyvsp - 1].take_blk();
                 let fmt = yyvs[yyvsp - 4].literal().cloned().unwrap_or_else(Jv::null);
                 yyval = YYSType::Blk(gen_binop(qqstring, gen_format(exp, jv_copy(&fmt)), '+' as i32));
             }
             // case 66: ElseBody: "elif" Exp "then" Exp ElseBody
             66 => {
-                let cond = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let then_exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let else_body = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let cond = yyvs[yyvsp - 3].take_blk();
+                let then_exp = yyvs[yyvsp - 1].take_blk();
+                let else_body = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_cond(cond, then_exp, else_body));
             }
             // case 67: ElseBody: "else" Exp "end"
             67 => {
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(exp);
             }
             // case 68: ElseBody: "end"
@@ -2101,18 +2097,18 @@ pub fn yyparse<T>(
             }
             // case 69: ExpD: ExpD '|' ExpD
             69 => {
-                let a = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let b = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let a = yyvs[yyvsp - 2].take_blk();
+                let b = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(a, b));
             }
             // case 70: ExpD: '-' ExpD
             70 => {
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(exp, gen_call("_negate", gen_noop())));
             }
             // case 71: ExpD: Term
             71 => {
-                let term = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(term);
             }
             // case 72: Term: '.'
@@ -2142,7 +2138,7 @@ pub fn yyparse<T>(
             }
             // case 76: Term: Term FIELD '?'
             76 => {
-                let term = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 2].take_blk();
                 let field = yyvs[yyvsp - 1].literal().cloned().unwrap_or_else(Jv::null);
                 yyval = YYSType::Blk(gen_index_opt(term, gen_const(field)));
             }
@@ -2153,18 +2149,18 @@ pub fn yyparse<T>(
             }
             // case 78: Term: Term '.' String '?'
             78 => {
-                let term = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let string = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 3].take_blk();
+                let string = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_index_opt(term, string));
             }
             // case 79: Term: '.' String '?'
             79 => {
-                let string = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let string = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_index_opt(gen_noop(), string));
             }
             // case 80: Term: Term FIELD
             80 => {
-                let term = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 1].take_blk();
                 let field = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
                 if debug_parser {
                     let field_str = if let Some(s) = field.string_value() { s.to_string() } else { "?".to_string() };
@@ -2183,13 +2179,13 @@ pub fn yyparse<T>(
             }
             // case 82: Term: Term '.' String
             82 => {
-                let term = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let string = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 2].take_blk();
+                let string = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_index(term, string));
             }
             // case 83: Term: '.' String
             83 => {
-                let string = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let string = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_index(gen_noop(), string));
             }
             // case 84: Term: '.' error
@@ -2206,14 +2202,14 @@ pub fn yyparse<T>(
             }
             // case 86: Term: Term '[' Exp ']' '?'
             86 => {
-                let term = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 4].take_blk();
+                let exp = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(gen_index_opt(term, exp));
             }
             // case 87: Term: Term '[' Exp ']'
             87 => {
-                let term = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 3].take_blk();
+                let exp = yyvs[yyvsp - 1].take_blk();
                 if debug_parser {
                     eprintln!("RULE 87 (Term: Term '[' Exp ']'): term is_noop={}, exp is_noop={}",
                              block_is_noop(&term), block_is_noop(&exp));
@@ -2226,72 +2222,72 @@ pub fn yyparse<T>(
             }
             // case 88: Term: Term '.' '[' Exp ']' '?'
             88 => {
-                let term = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 5].take_blk();
+                let exp = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(gen_index_opt(term, exp));
             }
             // case 89: Term: Term '.' '[' Exp ']'
             89 => {
-                let term = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 4].take_blk();
+                let exp = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_index(term, exp));
             }
             // case 90: Term: Term '[' ']' '?'
             90 => {
-                let term = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 3].take_blk();
                 yyval = YYSType::Blk(block_join(term, gen_op_simple(OpCode::EachOpt)));
             }
             // case 91: Term: Term '[' ']'
             91 => {
-                let term = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(block_join(term, gen_op_simple(OpCode::Each)));
             }
             // case 92: Term: Term '.' '[' ']' '?'
             92 => {
-                let term = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 4].take_blk();
                 yyval = YYSType::Blk(block_join(term, gen_op_simple(OpCode::EachOpt)));
             }
             // case 93: Term: Term '.' '[' ']'
             93 => {
-                let term = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 3].take_blk();
                 yyval = YYSType::Blk(block_join(term, gen_op_simple(OpCode::Each)));
             }
             // case 94: Term: Term '[' Exp ':' Exp ']' '?'
             94 => {
-                let term = yyvs[yyvsp - 6].blk().cloned().unwrap_or_else(gen_noop);
-                let start = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
-                let end = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 6].take_blk();
+                let start = yyvs[yyvsp - 4].take_blk();
+                let end = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(gen_slice_index(term, start, end, OpCode::IndexOpt));
             }
             // case 95: Term: Term '[' Exp ':' ']' '?'
             95 => {
-                let term = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let start = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 5].take_blk();
+                let start = yyvs[yyvsp - 3].take_blk();
                 yyval = YYSType::Blk(gen_slice_index(term, start, gen_const(Jv::null()), OpCode::IndexOpt));
             }
             // case 96: Term: Term '[' ':' Exp ']' '?'
             96 => {
-                let term = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let end = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 5].take_blk();
+                let end = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(gen_slice_index(term, gen_const(Jv::null()), end, OpCode::IndexOpt));
             }
             // case 97: Term: Term '[' Exp ':' Exp ']'
             97 => {
-                let term = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let start = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let end = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 5].take_blk();
+                let start = yyvs[yyvsp - 3].take_blk();
+                let end = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_slice_index(term, start, end, OpCode::Index));
             }
             // case 98: Term: Term '[' Exp ':' ']'
             98 => {
-                let term = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
-                let start = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 4].take_blk();
+                let start = yyvs[yyvsp - 2].take_blk();
                 yyval = YYSType::Blk(gen_slice_index(term, start, gen_const(Jv::null()), OpCode::Index));
             }
             // case 99: Term: Term '[' ':' Exp ']'
             99 => {
-                let term = yyvs[yyvsp - 4].blk().cloned().unwrap_or_else(gen_noop);
-                let end = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 4].take_blk();
+                let end = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_slice_index(term, gen_const(Jv::null()), end, OpCode::Index));
             }
             // case 100: Term: LITERAL
@@ -2301,7 +2297,7 @@ pub fn yyparse<T>(
             }
             // case 101: Term: String
             101 => {
-                let string = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let string = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(string);
             }
             // case 102: Term: FORMAT
@@ -2311,12 +2307,12 @@ pub fn yyparse<T>(
             }
             // case 103: Term: '(' Exp ')'
             103 => {
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(exp);
             }
             // case 104: Term: '[' Exp ']'
             104 => {
-                let exp = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(gen_collect(exp));
             }
             // case 105: Term: '[' ']'
@@ -2325,7 +2321,7 @@ pub fn yyparse<T>(
             }
             // case 106: Term: '{' MkDict '}'
             106 => {
-                let mkdict = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let mkdict = yyvs[yyvsp - 1].take_blk();
                 let o = gen_const_object(mkdict.clone());
                 if o.first.is_some() {
                     yyval = YYSType::Blk(o);
@@ -2351,7 +2347,9 @@ pub fn yyparse<T>(
             }
             // case 110: Term: IDENT
             110 => {
+                if debug { eprintln!("RULE 110: yyvsp={} yyvs[yyvsp]={:?}", yyvsp, std::mem::discriminant(&yyvs[yyvsp])); }
                 let ident = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
+                if debug { eprintln!("RULE 110: ident.kind={:?}", ident.get_kind()); }
                 let s = jv_string_value(&ident);
                 if s == "false" {
                     yyval = YYSType::Blk(gen_const(Jv::bool_val(false)));
@@ -2367,7 +2365,7 @@ pub fn yyparse<T>(
             // case 111: Term: IDENT '(' Args ')'
             111 => {
                 let ident = yyvs[yyvsp - 3].literal().cloned().unwrap_or_else(Jv::null);
-                let args = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let args = yyvs[yyvsp - 1].take_blk();
                 let ident_loc = yyls[yylsp - 3];
                 yyval = YYSType::Blk(gen_location(ident_loc, locations, gen_call(jv_string_value(&ident), args)));
                 jv_free(ident);
@@ -2382,7 +2380,7 @@ pub fn yyparse<T>(
             }
             // case 114: Term: Term '[' error ']'
             114 => {
-                let term = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
+                let term = yyvs[yyvsp - 3].take_blk();
                 yyval = YYSType::Blk(term);
             }
             // case 115: Term: '{' error '}'
@@ -2391,40 +2389,40 @@ pub fn yyparse<T>(
             }
             // case 116: Args: Arg
             116 => {
-                let arg = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let arg = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(arg);
             }
             // case 117: Args: Args ';' Arg
             117 => {
-                let args = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let arg = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let args = yyvs[yyvsp - 2].take_blk();
+                let arg = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(args, arg));
             }
             // case 118: Arg: Exp
             118 => {
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_lambda(exp));
             }
             // case 119: RepPatterns: RepPatterns "?//" Pattern
             119 => {
-                let rep = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let rep = yyvs[yyvsp - 2].take_blk();
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(rep, gen_destructure_alt(pat)));
             }
             // case 120: RepPatterns: Pattern
             120 => {
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_destructure_alt(pat));
             }
             // case 121: Patterns: RepPatterns "?//" Pattern
             121 => {
-                let rep = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let rep = yyvs[yyvsp - 2].take_blk();
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(rep, pat));
             }
             // case 122: Patterns: Pattern
             122 => {
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(pat);
             }
             // case 123: Pattern: BINDING
@@ -2435,34 +2433,34 @@ pub fn yyparse<T>(
             }
             // case 124: Pattern: '[' ArrayPats ']'
             124 => {
-                let arr_pats = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let arr_pats = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(arr_pats);
             }
             // case 125: Pattern: '{' ObjPats '}'
             125 => {
-                let obj_pats = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
+                let obj_pats = yyvs[yyvsp - 1].take_blk();
                 yyval = YYSType::Blk(obj_pats);
             }
             // case 126: ArrayPats: Pattern
             126 => {
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_array_matcher(gen_noop(), pat));
             }
             // case 127: ArrayPats: ArrayPats ',' Pattern
             127 => {
-                let arr_pats = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let arr_pats = yyvs[yyvsp - 2].take_blk();
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_array_matcher(arr_pats, pat));
             }
             // case 128: ObjPats: ObjPat
             128 => {
-                let obj_pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let obj_pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(obj_pat);
             }
             // case 129: ObjPats: ObjPats ',' ObjPat
             129 => {
-                let obj_pats = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let obj_pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let obj_pats = yyvs[yyvsp - 2].take_blk();
+                let obj_pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(block_join(obj_pats, obj_pat));
             }
             // case 130: ObjPat: BINDING
@@ -2477,7 +2475,7 @@ pub fn yyparse<T>(
             // case 131: ObjPat: BINDING ':' Pattern
             131 => {
                 let binding = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pat = yyvs[yyvsp].take_blk();
                 let name = jv_string_value(&binding);
                 let field_name = if name.starts_with('$') { &name[1..] } else { name };
                 yyval = YYSType::Blk(gen_object_matcher(gen_const(jv_string(field_name)), pat));
@@ -2486,33 +2484,35 @@ pub fn yyparse<T>(
             // case 132: ObjPat: IDENT ':' Pattern
             132 => {
                 let ident = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_object_matcher(gen_const(ident), pat));
             }
             // case 133: ObjPat: Keyword ':' Pattern
             133 => {
                 let keyword = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_object_matcher(gen_const(keyword), pat));
             }
             // case 134: ObjPat: String ':' Pattern
             134 => {
-                let string = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let string = yyvs[yyvsp - 2].take_blk();
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_object_matcher(string, pat));
             }
             // case 135: ObjPat: '(' Exp ')' ':' Pattern
             135 => {
-                let exp = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp - 3].take_blk();
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_object_matcher(exp, pat));
             }
             // case 136: ObjPat: '(' error ')' ':' Pattern
             136 => {
-                let pat = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pat = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(pat);
             }
-            // cases 137-154: Keyword productions
+            // cases 137-154: Keyword productions (C parser.c rules 137-154)
+            // Keyword: "as" | "def" | "module" | "import" | "include" | "if" | "then" | "else" | "elif"
+            //        | "reduce" | "foreach" | "end" | "and" | "or" | "try" | "catch" | "label" | "break"
             137..=154 => {
                 // All keywords just produce their literal value
                 let keyword = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
@@ -2524,91 +2524,91 @@ pub fn yyparse<T>(
             }
             // case 156: MkDict: MkDictPair
             156 => {
-                let pair = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let pair = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(pair);
             }
-            // case 157: MkDict: MkDict ',' MkDictPair
+            // case 157: MkDict: MkDictPair ',' MkDict
             157 => {
-                let dict = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let pair = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
-                yyval = YYSType::Blk(block_join(dict, pair));
+                let pair = yyvs[yyvsp - 2].take_blk();
+                let dict = yyvs[yyvsp].take_blk();
+                yyval = YYSType::Blk(block_join(pair, dict));
             }
-            // case 158: MkDict: error ',' MkDictPair
+            // case 158: MkDict: error ',' MkDict
             158 => {
-                let pair = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
-                yyval = YYSType::Blk(pair);
+                let dict = yyvs[yyvsp].take_blk();
+                yyval = YYSType::Blk(dict);
             }
             // case 159: MkDictPair: IDENT ':' ExpD
             159 => {
                 let ident = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_dictpair(gen_const(ident), exp));
             }
             // case 160: MkDictPair: Keyword ':' ExpD
             160 => {
                 let keyword = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_dictpair(gen_const(keyword), exp));
             }
             // case 161: MkDictPair: String ':' ExpD
             161 => {
-                let string = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let string = yyvs[yyvsp - 2].take_blk();
+                let exp = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_dictpair(string, exp));
             }
-            // case 162: MkDictPair: IDENT
+            // case 162: MkDictPair: String
+            // C: $$ = gen_dictpair($1, BLOCK(gen_op_simple(POP), gen_op_simple(DUP2),
+            //                              gen_op_simple(DUP2), gen_op_simple(INDEX)));
             162 => {
-                let ident = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
-                let name = jv_string_value(&ident);
-                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_copy(&ident)), gen_index(gen_noop(), gen_const(ident))));
+                let string = yyvs[yyvsp].take_blk();
+                yyval = YYSType::Blk(gen_dictpair(string.clone(), gen_index(gen_noop(), string)));
             }
             // case 163: MkDictPair: BINDING ':' ExpD
+            // C: $$ = gen_dictpair(gen_location(@$, locations, gen_op_unbound(LOADV, jv_string_value($1))), $3);
             163 => {
                 let binding = yyvs[yyvsp - 2].literal().cloned().unwrap_or_else(Jv::null);
-                let exp = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                let exp = yyvs[yyvsp].take_blk();
                 let name = jv_string_value(&binding);
-                let field_name = if name.starts_with('$') { &name[1..] } else { name };
-                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_string(field_name)), exp));
+                yyval = YYSType::Blk(gen_dictpair(gen_location(yyloc, locations, gen_op_unbound(OpCode::LoadV, name)), exp));
                 jv_free(binding);
             }
             // case 164: MkDictPair: BINDING
+            // C: $$ = gen_dictpair(gen_const($1), gen_location(@$, locations, gen_op_unbound(LOADV, jv_string_value($1))));
             164 => {
                 let binding = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
                 let name = jv_string_value(&binding);
-                let field_name = if name.starts_with('$') { &name[1..] } else { name };
-                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_string(field_name)), gen_location(yyloc, locations, gen_op_unbound(OpCode::LoadV, name))));
-                jv_free(binding);
+                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_copy(&binding)), gen_location(yyloc, locations, gen_op_unbound(OpCode::LoadV, name))));
             }
-            // case 165: MkDictPair: IDENT '(' Args ')'
+            // case 165: MkDictPair: IDENT (bare identifier like {a})
+            // C: $$ = gen_dictpair(gen_const(jv_copy($1)), gen_index(gen_noop(), gen_const($1)));
             165 => {
-                let ident = yyvs[yyvsp - 3].literal().cloned().unwrap_or_else(Jv::null);
-                let args = yyvs[yyvsp - 1].blk().cloned().unwrap_or_else(gen_noop);
-                let name = jv_string_value(&ident);
-                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_copy(&ident)), gen_call(name, args)));
-                jv_free(ident);
+                if debug { eprintln!("RULE 165: yyvsp={} yyvs[yyvsp]={:?}", yyvsp, std::mem::discriminant(&yyvs[yyvsp])); }
+                let ident = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
+                if debug { eprintln!("RULE 165: ident.kind={:?}", ident.get_kind()); }
+                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_copy(&ident)), gen_index(gen_noop(), gen_const(ident))));
             }
-            // case 166: MkDictPair: '(' Exp ')' ':' ExpD
+            // case 166: MkDictPair: "$__loc__"
+            // C: $$ = gen_dictpair(gen_const(jv_string("__loc__")), gen_loc_object(&@$, locations));
             166 => {
-                let key = yyvs[yyvsp - 3].blk().cloned().unwrap_or_else(gen_noop);
-                let val = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
+                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_string("__loc__")), gen_loc_object(&yyloc, locations)));
+            }
+            // case 167: MkDictPair: Keyword
+            // C: $$ = gen_dictpair(gen_const(jv_copy($1)), gen_index(gen_noop(), gen_const($1)));
+            167 => {
+                let keyword = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
+                yyval = YYSType::Blk(gen_dictpair(gen_const(jv_copy(&keyword)), gen_index(gen_noop(), gen_const(keyword))));
+            }
+            // case 168: MkDictPair: '(' Exp ')' ':' ExpD
+            // C: $$ = gen_dictpair($2, $5);
+            168 => {
+                let key = yyvs[yyvsp - 3].take_blk();
+                let val = yyvs[yyvsp].take_blk();
                 yyval = YYSType::Blk(gen_dictpair(key, val));
             }
-            // case 167: MkDictPair: '(' error ')' ':' ExpD
-            167 => {
-                let val = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
-                yyval = YYSType::Blk(val);
-            }
-            // case 168: MkDictPair: '(' Exp ')' "as" Patterns '|' MkDictPair
-            168 => {
-                let exp = yyvs[yyvsp - 5].blk().cloned().unwrap_or_else(gen_noop);
-                let patterns = yyvs[yyvsp - 2].blk().cloned().unwrap_or_else(gen_noop);
-                let dictpair = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
-                yyval = YYSType::Blk(gen_destructure(exp, patterns, dictpair));
-            }
-            // case 169: MkDictPair: '(' error ')' "as" Patterns '|' MkDictPair
+            // case 169: MkDictPair: error ':' ExpD
             169 => {
-                let dictpair = yyvs[yyvsp].blk().cloned().unwrap_or_else(gen_noop);
-                yyval = YYSType::Blk(dictpair);
+                let val = yyvs[yyvsp].take_blk();
+                yyval = YYSType::Blk(val);
             }
             // Default: do nothing (default action from bison)
             _ => {}
@@ -2805,8 +2805,12 @@ pub fn jq_parse<T>(locations: &mut Locfile<T>, answer: &mut Block) -> i32 {
     let mut errors = 0i32;
     *answer = gen_noop();
 
+    let debug_parse = std::env::var("DEBUG_PARSE").is_ok();
+    if debug_parse { eprintln!("DEBUG jq_parse: calling yyparse, input len={}", locations.data.len()); }
+
     // Call the actual parser
     let parse_result = yyparse(answer, &mut errors, locations, &mut lexer_param);
+    if debug_parse { eprintln!("DEBUG jq_parse: yyparse returned {}, errors={}", parse_result, errors); }
 
     // Clean up lexer resources
     jq_yy_delete_buffer(Some(buf), &mut lexer);
@@ -2902,6 +2906,14 @@ impl YYSType {
         match self {
             YYSType::Blk(b) => Some(b),
             _ => None,
+        }
+    }
+    /// Take (move) a block out of this YYSType, replacing it with a noop
+    /// This avoids expensive cloning of block instruction lists
+    pub fn take_blk(&mut self) -> Block {
+        match std::mem::take(self) {
+            YYSType::Blk(b) => b,
+            _ => gen_noop(),
         }
     }
 }

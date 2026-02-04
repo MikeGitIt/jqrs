@@ -2512,17 +2512,28 @@ fn jvp_number_flags(number_type: u8, allocated: bool) -> u8 {
 /// Consumes the input value.
 pub fn jv_invalid_get_msg(inv: Jv) -> Jv {
     assert!(jvp_has_kind(& inv, JvKind::Invalid), "JVP_HAS_KIND(inv, JV_KIND_INVALID)");
-    let x = if inv.kind_flags == jvp_invalid_allocated_flags() {
+    let debug = std::env::var("DEBUG_EXEC").is_ok();
+    let expected = jvp_invalid_allocated_flags();
+    if debug {
+        eprintln!("DEBUG jv_invalid_get_msg: inv.kind_flags=0x{:02x} expected=0x{:02x} inv.u=0x{:x}",
+                  inv.kind_flags, expected, inv.u);
+    }
+    let x = if inv.kind_flags == expected {
         if let Some(ref invalid_ptr) = jvp_invalid_ptr(&inv) {
             if let Some(ref errmsg) = invalid_ptr.errmsg {
-                jv_copy(&(**errmsg))
+                let r = jv_copy(&(**errmsg));
+                if debug { eprintln!("DEBUG jv_invalid_get_msg: got errmsg, kind={:?}", r.get_kind()); }
+                r
             } else {
+                if debug { eprintln!("DEBUG jv_invalid_get_msg: errmsg is None"); }
                 jv_null()
             }
         } else {
+            if debug { eprintln!("DEBUG jv_invalid_get_msg: invalid_ptr is None"); }
             jv_null()
         }
     } else {
+        if debug { eprintln!("DEBUG jv_invalid_get_msg: flags don't match, returning null"); }
         jv_null()
     };
     jv_free(inv);

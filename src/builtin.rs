@@ -165,7 +165,7 @@ use crate::jv_aux::{jv_cmp, jv_has, jv_setpath, jv_sort, jv_keys_unsorted, jv_gr
 use crate::execute::{jq_get_prog_origin, jq_halt, jq_get_jq_origin, jq_get_debug_cb, _jq_path_append, jq_get_lib_dirs, jq_get_input_cb};
 use std::rc::Rc;
 use std::cell::RefCell;
-use crate::jv::{Jv, JvKind};
+use crate::jv::{Jv, JvKind, jv_array_append, jv_string_split, jv_string_explode};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -697,16 +697,6 @@ pub fn jv_array_length(v: &Jv) -> i32 {
 pub fn jv_array_get(v: &Jv, idx: i32) -> Jv {
     crate::jv::jv_array_get(v.copy(), idx)
 }
-/// Append to array
-/// Note: This is a simplified implementation - just increments size
-/// A full implementation would need array storage
-pub fn jv_array_append(mut v: Jv, val: Jv) -> Jv {
-    jv_free(val);
-    if jv_get_kind(&v) == JvKind::Array {
-        v.size += 1;
-    }
-    v
-}
 /// Check if jv is valid
 pub fn jv_is_valid(v: &Jv) -> bool {
     v.is_valid()
@@ -952,38 +942,157 @@ pub fn f_strptime<T>(_jq: &mut JqState<T>, a: Jv, b: Jv) -> Jv {
         }
     }
 }
-/// Simplified strptime implementation
-fn strptime_simple<'a>(input: &'a str, _fmt: &str, tm: &mut Tm) -> Option<&'a str> {
-    if input.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = input
-        .split(|c| c == '-' || c == ' ' || c == ':' || c == 'T')
-        .collect();
-    if parts.len() >= 3 {
-        if let (Ok(year), Ok(month), Ok(day)) = (
-            parts[0].parse::<i32>(),
-            parts[1].parse::<i32>(),
-            parts[2].parse::<i32>(),
-        ) {
-            tm.tm_year = year - 1900;
-            tm.tm_mon = month - 1;
-            tm.tm_mday = day;
-            if parts.len() >= 6 {
-                if let (Ok(hour), Ok(min), Ok(sec)) = (
-                    parts[3].parse::<i32>(),
-                    parts[4].parse::<i32>(),
-                    parts[5].parse::<i32>(),
-                ) {
-                    tm.tm_hour = hour;
-                    tm.tm_min = min;
-                    tm.tm_sec = sec;
+/// strptime implementation - parses date string according to format
+fn strptime_simple<'a>(input: &'a str, fmt: &str, tm: &mut Tm) -> Option<&'a str> {
+    let input_bytes = input.as_bytes();
+    let fmt_bytes = fmt.as_bytes();
+    let mut input_pos = 0;
+    let mut fmt_pos = 0;
+
+    while fmt_pos < fmt_bytes.len() {
+        if fmt_bytes[fmt_pos] == b'%' {
+            fmt_pos += 1;
+            if fmt_pos >= fmt_bytes.len() {
+                return None;
+            }
+            let spec = fmt_bytes[fmt_pos];
+            fmt_pos += 1;
+
+            match spec {
+                b'Y' => {
+                    // 4-digit year
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 4)?;
+                    tm.tm_year = val - 1900;
+                    input_pos += consumed;
+                }
+                b'y' => {
+                    // 2-digit year
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 2)?;
+                    tm.tm_year = if val < 69 { val + 100 } else { val };
+                    input_pos += consumed;
+                }
+                b'm' => {
+                    // Month 01-12
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 2)?;
+                    if val < 1 || val > 12 { return None; }
+                    tm.tm_mon = val - 1;
+                    input_pos += consumed;
+                }
+                b'd' => {
+                    // Day of month 01-31
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 2)?;
+                    if val < 1 || val > 31 { return None; }
+                    tm.tm_mday = val;
+                    input_pos += consumed;
+                }
+                b'H' => {
+                    // Hour 00-23
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 2)?;
+                    if val > 23 { return None; }
+                    tm.tm_hour = val;
+                    input_pos += consumed;
+                }
+                b'M' => {
+                    // Minute 00-59
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 2)?;
+                    if val > 59 { return None; }
+                    tm.tm_min = val;
+                    input_pos += consumed;
+                }
+                b'S' => {
+                    // Second 00-61 (60,61 for leap seconds)
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 2)?;
+                    if val > 61 { return None; }
+                    tm.tm_sec = val;
+                    input_pos += consumed;
+                }
+                b'j' => {
+                    // Day of year 001-366
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 3)?;
+                    if val < 1 || val > 366 { return None; }
+                    tm.tm_yday = val - 1;
+                    input_pos += consumed;
+                }
+                b'w' => {
+                    // Weekday 0-6
+                    let (val, consumed) = parse_int(&input_bytes[input_pos..], 1)?;
+                    if val > 6 { return None; }
+                    tm.tm_wday = val;
+                    input_pos += consumed;
+                }
+                b'n' | b't' => {
+                    // Whitespace
+                    while input_pos < input_bytes.len() &&
+                          (input_bytes[input_pos] == b' ' || input_bytes[input_pos] == b'\t') {
+                        input_pos += 1;
+                    }
+                }
+                b'%' => {
+                    // Literal %
+                    if input_pos >= input_bytes.len() || input_bytes[input_pos] != b'%' {
+                        return None;
+                    }
+                    input_pos += 1;
+                }
+                b'Z' => {
+                    // Timezone name - skip alphabetic chars
+                    while input_pos < input_bytes.len() && input_bytes[input_pos].is_ascii_alphabetic() {
+                        input_pos += 1;
+                    }
+                }
+                b'z' => {
+                    // Timezone offset (+/-HHMM)
+                    if input_pos >= input_bytes.len() { return None; }
+                    if input_bytes[input_pos] == b'+' || input_bytes[input_pos] == b'-' {
+                        input_pos += 1;
+                        let (_, consumed) = parse_int(&input_bytes[input_pos..], 4)?;
+                        input_pos += consumed;
+                    }
+                }
+                _ => {
+                    // Unknown specifier - try to skip
                 }
             }
-            return Some("");
+        } else if fmt_bytes[fmt_pos].is_ascii_whitespace() {
+            // Format has whitespace - skip whitespace in input
+            fmt_pos += 1;
+            while input_pos < input_bytes.len() && input_bytes[input_pos].is_ascii_whitespace() {
+                input_pos += 1;
+            }
+        } else {
+            // Literal character - must match
+            if input_pos >= input_bytes.len() || input_bytes[input_pos] != fmt_bytes[fmt_pos] {
+                return None;
+            }
+            input_pos += 1;
+            fmt_pos += 1;
         }
     }
-    None
+
+    Some(&input[input_pos..])
+}
+
+/// Parse an integer from bytes, returning (value, bytes_consumed)
+fn parse_int(bytes: &[u8], max_digits: usize) -> Option<(i32, usize)> {
+    let mut val: i32 = 0;
+    let mut consumed = 0;
+
+    // Skip leading whitespace
+    while consumed < bytes.len() && bytes[consumed].is_ascii_whitespace() {
+        consumed += 1;
+    }
+
+    let start = consumed;
+    while consumed < bytes.len() && consumed - start < max_digits && bytes[consumed].is_ascii_digit() {
+        val = val * 10 + (bytes[consumed] - b'0') as i32;
+        consumed += 1;
+    }
+
+    if consumed == start {
+        return None;
+    }
+
+    Some((val, consumed))
 }
 /// Find minimum by key
 pub fn f_min_by_impl<T>(_jq: &mut JqState<T>, x: Jv, y: Jv) -> Jv {
@@ -1089,23 +1198,61 @@ pub fn f_strftime<T>(jq: &mut JqState<T>, a: Jv, b: Jv) -> Jv {
         None => jv_invalid_with_msg(jv_string("strftime/1: unknown system failure")),
     }
 }
-/// Simplified strftime implementation
+/// strftime implementation - formats time according to format string
 fn strftime_simple(fmt: &str, tm: &Tm) -> Option<String> {
+    static WEEKDAY_ABBREV: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    static WEEKDAY_FULL: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    static MONTH_ABBREV: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    static MONTH_FULL: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
     let mut result = String::with_capacity(fmt.len() + 100);
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '%' {
             match chars.next() {
+                // Date
                 Some('Y') => result.push_str(&format!("{:04}", tm.tm_year + 1900)),
+                Some('y') => result.push_str(&format!("{:02}", (tm.tm_year + 1900) % 100)),
+                Some('C') => result.push_str(&format!("{:02}", (tm.tm_year + 1900) / 100)),
                 Some('m') => result.push_str(&format!("{:02}", tm.tm_mon + 1)),
                 Some('d') => result.push_str(&format!("{:02}", tm.tm_mday)),
+                Some('e') => result.push_str(&format!("{:2}", tm.tm_mday)),
+                Some('j') => result.push_str(&format!("{:03}", tm.tm_yday + 1)),
+                // Time
                 Some('H') => result.push_str(&format!("{:02}", tm.tm_hour)),
+                Some('I') => result.push_str(&format!("{:02}", if tm.tm_hour == 0 { 12 } else if tm.tm_hour > 12 { tm.tm_hour - 12 } else { tm.tm_hour })),
+                Some('k') => result.push_str(&format!("{:2}", tm.tm_hour)),
+                Some('l') => result.push_str(&format!("{:2}", if tm.tm_hour == 0 { 12 } else if tm.tm_hour > 12 { tm.tm_hour - 12 } else { tm.tm_hour })),
                 Some('M') => result.push_str(&format!("{:02}", tm.tm_min)),
                 Some('S') => result.push_str(&format!("{:02}", tm.tm_sec)),
-                Some('j') => result.push_str(&format!("{:03}", tm.tm_yday + 1)),
+                Some('p') => result.push_str(if tm.tm_hour < 12 { "AM" } else { "PM" }),
+                Some('P') => result.push_str(if tm.tm_hour < 12 { "am" } else { "pm" }),
+                // Weekday
                 Some('w') => result.push_str(&format!("{}", tm.tm_wday)),
+                Some('u') => result.push_str(&format!("{}", if tm.tm_wday == 0 { 7 } else { tm.tm_wday })),
+                Some('a') => result.push_str(WEEKDAY_ABBREV.get(tm.tm_wday as usize).unwrap_or(&"???")),
+                Some('A') => result.push_str(WEEKDAY_FULL.get(tm.tm_wday as usize).unwrap_or(&"???")),
+                // Month name
+                Some('b') | Some('h') => result.push_str(MONTH_ABBREV.get(tm.tm_mon as usize).unwrap_or(&"???")),
+                Some('B') => result.push_str(MONTH_FULL.get(tm.tm_mon as usize).unwrap_or(&"???")),
+                // Composite
+                Some('D') => result.push_str(&format!("{:02}/{:02}/{:02}", tm.tm_mon + 1, tm.tm_mday, (tm.tm_year + 1900) % 100)),
+                Some('F') => result.push_str(&format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)),
+                Some('T') => result.push_str(&format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)),
+                Some('R') => result.push_str(&format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)),
+                // Special
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
                 Some('%') => result.push('%'),
+                Some('Z') => result.push_str("UTC"), // Simplified - always UTC
+                Some('z') => result.push_str("+0000"), // Simplified - always UTC
+                Some('s') => {
+                    // Seconds since epoch - use existing timegm function
+                    let epoch_seconds = timegm(tm);
+                    result.push_str(&format!("{}", epoch_seconds));
+                }
                 Some(other) => {
+                    // Unknown specifier - pass through
                     result.push('%');
                     result.push(other);
                 }
@@ -1117,6 +1264,7 @@ fn strftime_simple(fmt: &str, tm: &Tm) -> Option<String> {
     }
     Some(result)
 }
+
 /// Extract exponent of floating point number (logb)
 pub fn f_logb<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
     if jv_get_kind(&input) != JvKind::Number {
@@ -1269,24 +1417,6 @@ fn jv_kind_name(kind: JvKind) -> &'static str {
         JvKind::Object => "object",
     }
 }
-/// Dump a jv value to a truncated string buffer
-pub fn jv_dump_string_trunc(v: Jv, bufsize: usize) -> String {
-    let s = match jv_get_kind(&v) {
-        JvKind::String => jv_string_value(&v).to_string(),
-        JvKind::Number => jv_number_value(&v).to_string(),
-        JvKind::Null => "null".to_string(),
-        JvKind::True => "true".to_string(),
-        JvKind::False => "false".to_string(),
-        JvKind::Array => "[...]".to_string(),
-        JvKind::Object => "{...}".to_string(),
-        JvKind::Invalid => "invalid".to_string(),
-    };
-    if s.len() > bufsize {
-        format!("{}...", &s[..bufsize.saturating_sub(3)])
-    } else {
-        s
-    }
-}
 /// Compute the exponential of the input number
 pub fn f_exp<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
     if jv_get_kind(&input) != JvKind::Number {
@@ -1406,12 +1536,8 @@ fn jv_number_with_literal(s: &str) -> Jv {
         Err(_) => jv_null(),
     }
 }
-fn jv_parse_sized(s: &str, _len: i32) -> Jv {
-    // Parse JSON from string - stub implementation
-    match s.parse::<f64>() {
-        Ok(n) => jv_number(n),
-        Err(_) => jv_null(),
-    }
+fn jv_parse_sized(s: &str, len: i32) -> Jv {
+    crate::jv_parse::jv_parse_sized(s, len)
 }
 /// Create a boolean Jv
 pub fn jv_bool(val: bool) -> Jv {
@@ -1879,30 +2005,6 @@ pub fn f_atanh<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
     jv_free(input);
     ret
 }
-/// Helper function to split a string
-fn jv_string_split(a: Jv, b: Jv) -> Jv {
-    // In this simplified implementation, string operations are stubs
-    if jv_get_kind(&a) == JvKind::String && jv_get_kind(&b) == JvKind::String {
-        // String content not accessible in this representation
-        // Return an empty array as placeholder
-        jv_free(a);
-        jv_free(b);
-        Jv::array()
-    } else {
-        type_error2(a, b, "string split requires strings")
-    }
-}
-/// Helper function to explode a string into codepoints
-fn jv_string_explode(a: Jv) -> Jv {
-    if jv_get_kind(&a) == JvKind::String {
-        // String content not accessible in this representation
-        // Return an empty array as placeholder
-        jv_free(a);
-        Jv::array()
-    } else {
-        ret_error(a, jv_string("explode input must be a string"))
-    }
-}
 /// Helper to get current line from jq input (stub implementation)
 fn jq_util_input_get_current_line<T>(_jq: &JqState<T>) -> Jv {
     Jv::null()
@@ -2188,11 +2290,15 @@ pub fn builtins_bind<T>(_jq: &mut JqState<T>, bb: Block) -> Block {
     use crate::types::Cfunction;
     use crate::parser::jq_parse_library;
 
+    let debug = std::env::var("DEBUG_BUILTINS").is_ok();
+    if debug { eprintln!("DEBUG builtins_bind: Step 1 - parsing JQ_BUILTINS"); }
+
     // Step 1: Parse JQ_BUILTINS (the embedded builtin.jq content)
     // This gives us jq-defined functions like map, select, add, unique, etc.
     let mut jq_builtins_block = Block::default();
     let mut locfile: Locfile<()> = Locfile::new("<builtin>", JQ_BUILTINS);
     let nerrors = jq_parse_library(&mut locfile, &mut jq_builtins_block);
+    if debug { eprintln!("DEBUG builtins_bind: Step 1 done, nerrors={}", nerrors); }
     if nerrors != 0 {
         eprintln!("Warning: Failed to parse builtin.jq ({} errors)", nerrors);
         // Continue with empty block - native functions will still work
@@ -2200,7 +2306,9 @@ pub fn builtins_bind<T>(_jq: &mut JqState<T>, bb: Block) -> Block {
     }
 
     // Step 2: Add bytecoded builtins (empty, not, path)
+    if debug { eprintln!("DEBUG builtins_bind: Step 2 - binding bytecoded builtins"); }
     let builtins = bind_bytecoded_builtins(jq_builtins_block);
+    if debug { eprintln!("DEBUG builtins_bind: Step 2 done"); }
 
     // Step 3: Create the native function list - ONLY functions implemented in Rust
     // These mirror C jq's function_list in builtin.c
@@ -2323,13 +2431,20 @@ pub fn builtins_bind<T>(_jq: &mut JqState<T>, bb: Block) -> Block {
     ];
 
     let ncfunctions = function_list.len() as i32;
+    if debug { eprintln!("DEBUG builtins_bind: Step 3 - gen_cbinding with {} cfunctions", ncfunctions); }
     let builtins_with_cfuncs = gen_cbinding(&function_list, ncfunctions, builtins);
+    if debug { eprintln!("DEBUG builtins_bind: Step 3 done"); }
 
     // Step 4: Generate the builtins list
+    if debug { eprintln!("DEBUG builtins_bind: Step 4 - gen_builtin_list"); }
     let final_builtins = gen_builtin_list(builtins_with_cfuncs);
+    if debug { eprintln!("DEBUG builtins_bind: Step 4 done"); }
 
     // Step 5: Bind to the program block
-    block_bind_referenced(final_builtins, bb, OP_IS_CALL_PSEUDO)
+    if debug { eprintln!("DEBUG builtins_bind: Step 5 - block_bind_referenced"); }
+    let result = block_bind_referenced(final_builtins, bb, OP_IS_CALL_PSEUDO);
+    if debug { eprintln!("DEBUG builtins_bind: Step 5 done"); }
+    result
 }
 /// Returns the next representable floating-point value after a towards b
 pub fn f_nextafter<T>(_jq: &mut JqState<T>, input: Jv, a: Jv, b: Jv) -> Jv {
@@ -3119,8 +3234,7 @@ pub fn binop_multiply(a: Jv, b: Jv) -> Jv {
         return res;
     }
     if ak == JvKind::Object && bk == JvKind::Object {
-        // Simplified recursive merge - for full implementation would deep merge
-        return jv_object_merge(a, b);
+        return crate::jv::jv_object_merge_recursive(a, b);
     }
     type_error2(a, b, "cannot be multiplied")
 }
@@ -3419,6 +3533,7 @@ pub fn f_string_implode<T>(_jq: &mut JqState<T>, a: Jv) -> Jv {
     jv_string(&result)
 }
 /// Check if two jv values are equal
+/// C: int jv_equal(jv a, jv b) in jv.c
 pub fn jv_equal(a: Jv, b: Jv) -> bool {
     let ka = jv_get_kind(&a);
     let kb = jv_get_kind(&b);
@@ -3430,20 +3545,57 @@ pub fn jv_equal(a: Jv, b: Jv) -> bool {
         JvKind::True => true,
         JvKind::False => true,
         JvKind::Number => {
+            // C: jvp_number_equal
             let va = jv_number_value(&a);
             let vb = jv_number_value(&b);
             (va - vb).abs() < f64::EPSILON
         }
         JvKind::String => {
+            // C: jvp_string_equal
             jv_string_value(&a) == jv_string_value(&b)
         }
         JvKind::Array => {
-            // Simplified comparison using size
-            a.size == b.size
+            // C: jvp_array_equal in jv.c lines 878-890
+            let len_a = jv_array_length(&a);
+            let len_b = jv_array_length(&b);
+            if len_a != len_b {
+                return false;
+            }
+            for i in 0..len_a {
+                let elem_a = jv_array_get(&a, i);
+                let elem_b = jv_array_get(&b, i);
+                if !jv_equal(elem_a, elem_b) {
+                    return false;
+                }
+            }
+            true
         }
         JvKind::Object => {
-            // Simplified comparison using size
-            a.size == b.size
+            // C: jvp_object_equal in jv.c lines 1705-1718
+            let keys_a = crate::jv_aux::jv_keys(jv_copy(&a));
+            let keys_b = crate::jv_aux::jv_keys(jv_copy(&b));
+            let len_a = jv_array_length(&keys_a);
+            let len_b = jv_array_length(&keys_b);
+            if len_a != len_b {
+                jv_free(keys_a);
+                jv_free(keys_b);
+                return false;
+            }
+            // Check each key in a exists in b with equal value
+            for i in 0..len_a {
+                let key = jv_array_get(&keys_a, i);
+                let val_a = crate::jv::jv_object_get(&a, jv_copy(&key));
+                let val_b = crate::jv::jv_object_get(&b, jv_copy(&key));
+                jv_free(key);
+                if !jv_equal(val_a, val_b) {
+                    jv_free(keys_a);
+                    jv_free(keys_b);
+                    return false;
+                }
+            }
+            jv_free(keys_a);
+            jv_free(keys_b);
+            true
         }
         JvKind::Invalid => false,
     }

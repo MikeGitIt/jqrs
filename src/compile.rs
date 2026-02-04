@@ -128,8 +128,8 @@ fn dump_block(b: &Block, prefix: &str) {
         unsafe {
             let inst = &*ptr;
             let op_name = opcode_describe(inst.op as u16).name;
-            eprintln!("{}: inst[{}] op={} ({}) symbol={:?}",
-                     prefix, idx, inst.op, op_name, inst.symbol);
+            eprintln!("{}: inst[{}] @ {:?} op={} ({}) symbol={:?} bound_by={:?}",
+                     prefix, idx, ptr, inst.op, op_name, inst.symbol, inst.bound_by);
             idx += 1;
             curr = inst.next.as_ref().map(|b| b.as_ref() as *const Inst);
         }
@@ -338,6 +338,7 @@ impl Clone for Block {
             old_opt: &Option<Box<Inst>>,
             new_opt: &Option<Box<Inst>>,
             ptr_map: &mut HashMap<*const Inst, *mut Inst>,
+            debug: bool,
         ) {
             let (Some(ref old_first), Some(ref new_first)) = (old_opt, new_opt) else {
                 return;
@@ -347,16 +348,20 @@ impl Clone for Block {
 
             while let (Some(old_inst), Some(new_inst)) = (old_curr, new_curr) {
                 // Add this instruction to the map
-                ptr_map.insert(
-                    old_inst as *const Inst,
-                    new_inst as *const Inst as *mut Inst,
-                );
+                let old_ptr = old_inst as *const Inst;
+                let new_ptr = new_inst as *const Inst as *mut Inst;
+                ptr_map.insert(old_ptr, new_ptr);
+
+                if debug && (old_inst.op == CLOSURE_CREATE || old_inst.op == CLOSURE_PARAM) {
+                    eprintln!("  collect_mappings: op={} {:?} -> {:?} symbol={:?}",
+                        old_inst.op, old_ptr, new_ptr, old_inst.symbol);
+                }
 
                 // Recurse into subfn
-                collect_mappings(&old_inst.subfn.first, &new_inst.subfn.first, ptr_map);
+                collect_mappings(&old_inst.subfn.first, &new_inst.subfn.first, ptr_map, debug);
 
                 // Recurse into arglist
-                collect_mappings(&old_inst.arglist.first, &new_inst.arglist.first, ptr_map);
+                collect_mappings(&old_inst.arglist.first, &new_inst.arglist.first, ptr_map, debug);
 
                 // Move to next instruction in list
                 old_curr = old_inst.next.as_ref().map(|b| b.as_ref());
@@ -364,10 +369,13 @@ impl Clone for Block {
             }
         }
 
-        collect_mappings(&self.first, &first, &mut ptr_map);
+        let debug = std::env::var("DEBUG_COMPILE").is_ok();
+        if debug { eprintln!("Block::clone - collecting mappings..."); }
+        collect_mappings(&self.first, &first, &mut ptr_map, debug);
+        if debug { eprintln!("Block::clone - collected {} mappings", ptr_map.len()); }
 
         // Phase 3: Remap ALL pointers in the ENTIRE new tree (main + subfn + arglist)
-        fn remap_pointers(new_opt: &Option<Box<Inst>>, ptr_map: &HashMap<*const Inst, *mut Inst>) {
+        fn remap_pointers(new_opt: &Option<Box<Inst>>, ptr_map: &HashMap<*const Inst, *mut Inst>, debug: bool) {
             let Some(ref new_first) = new_opt else {
                 return;
             };
@@ -379,8 +387,26 @@ impl Clone for Block {
 
                     // Remap bound_by pointer
                     if let Some(old_bound) = inst.bound_by {
-                        if let Some(&new_bound) = ptr_map.get(&(old_bound as *const Inst)) {
+                        // CLOSURE_CREATE and CLOSURE_PARAM must ALWAYS be self-bound
+                        if inst.op == CLOSURE_CREATE || inst.op == CLOSURE_PARAM {
+                            let sym = inst.symbol.as_deref().unwrap_or("");
+                            if debug && sym == "recurse" {
+                                eprintln!("  REMAP: recurse CLOSURE_CREATE at {:?} setting to self (was {:?})",
+                                    ptr, old_bound);
+                            }
+                            inst.bound_by = Some(ptr);
+                        } else if let Some(&new_bound) = ptr_map.get(&(old_bound as *const Inst)) {
+                            if debug {
+                                eprintln!("  REMAP: op={} symbol={:?} bound_by {:?} -> {:?}",
+                                    inst.op, inst.symbol, old_bound, new_bound);
+                            }
                             inst.bound_by = Some(new_bound);
+                        } else {
+                            // Not in map - this could be an external reference or a bug
+                            if debug {
+                                eprintln!("  REMAP WARNING: op={} symbol={:?} bound_by {:?} NOT IN MAP",
+                                    inst.op, inst.symbol, old_bound);
+                            }
                         }
                     }
 
@@ -399,17 +425,43 @@ impl Clone for Block {
                     }
 
                     // Recurse into subfn
-                    remap_pointers(&inst.subfn.first, ptr_map);
+                    remap_pointers(&inst.subfn.first, ptr_map, debug);
 
                     // Recurse into arglist
-                    remap_pointers(&inst.arglist.first, ptr_map);
+                    remap_pointers(&inst.arglist.first, ptr_map, debug);
 
                     curr = inst.next.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
                 }
             }
         }
 
-        remap_pointers(&first, &ptr_map);
+        remap_pointers(&first, &ptr_map, debug);
+
+        // Debug: verify CLOSURE_CREATE self-bindings after remap
+        if std::env::var("DEBUG_COMPILE").is_ok() {
+            fn check_bindings(opt: &Option<Box<Inst>>, ptr_map: &HashMap<*const Inst, *mut Inst>) {
+                let Some(ref first) = opt else { return };
+                let mut curr = Some(first.as_ref());
+                while let Some(inst) = curr {
+                    if inst.op == 33 { // CLOSURE_CREATE
+                        let self_ptr = inst as *const Inst;
+                        if let Some(bound) = inst.bound_by {
+                            if bound as *const Inst != self_ptr {
+                                let bound_in_keys = ptr_map.contains_key(&(bound as *const Inst));
+                                let mapped_to = ptr_map.get(&(bound as *const Inst));
+                                eprintln!("CLONE DEBUG: CLOSURE_CREATE not self-bound!");
+                                eprintln!("  self={:?} bound_by={:?} symbol={:?}", self_ptr, bound, inst.symbol);
+                                eprintln!("  bound_by in ptr_map keys: {}, maps to: {:?}", bound_in_keys, mapped_to);
+                            }
+                        }
+                    }
+                    check_bindings(&inst.subfn.first, ptr_map);
+                    check_bindings(&inst.arglist.first, ptr_map);
+                    curr = inst.next.as_ref().map(|b| b.as_ref());
+                }
+            }
+            check_bindings(&first, &ptr_map);
+        }
 
         // Find the last instruction in the cloned list
         let last = if first.is_some() {
@@ -629,9 +681,8 @@ pub fn gen_call(name: &str, args: Block) -> Block {
 }
 /// Generate a lambda expression
 pub fn gen_lambda(body: Block) -> Block {
-    let mut i = inst_new(CLOSURE_CREATE);
-    i.subfn = body;
-    inst_block(i)
+    // In C, this is: return gen_function("@lambda", gen_noop(), body);
+    gen_function("@lambda", gen_noop(), body)
 }
 /// Generate a subexpression block
 pub fn gen_subexp(a: Block) -> Block {
@@ -773,6 +824,11 @@ pub fn gen_function(name: &str, mut formals: Block, mut body: Block) -> Block {
 
         // Set self-binding: the CLOSURE_CREATE binds to itself
         first.bound_by = Some(binder_ptr);
+
+        if std::env::var("DEBUG_COMPILE").is_ok() {
+            eprintln!("gen_function({:?}): set bound_by={:?} on instruction at {:?}",
+                name, binder_ptr, binder_ptr);
+        }
 
         // Bind unbound references in subfn and arglist to this binder
         let bindflags = OP_IS_CALL_PSEUDO | OP_HAS_BINDING;
@@ -966,7 +1022,24 @@ pub fn bind_alternation_matchers(
 }
 
 /// Bind a matcher block to a body (local version using Block type)
-fn bind_matcher_local(matcher: Block, body: Block) -> Block {
+/// This matches C's bind_matcher: for each STOREV/STOREVN that's unbound,
+/// bind it to the body with OP_HAS_VARIABLE
+fn bind_matcher_local(mut matcher: Block, mut body: Block) -> Block {
+    // Iterate through matcher looking for unbound STOREV/STOREVN
+    let mut current_ptr: Option<*mut Inst> = matcher.first.as_mut().map(|b| b.as_mut() as *mut Inst);
+    while let Some(ptr) = current_ptr {
+        let inst = unsafe { &mut *ptr };
+        if (inst.op == STOREV || inst.op == STOREVN) && inst.bound_by.is_none() {
+            // Create a reference-only binder block (first: None, last: Some(ptr))
+            // This avoids ownership issues while allowing binding
+            let mut binder = Block {
+                first: None,
+                last: Some(ptr),
+            };
+            block_bind_subblock(&mut binder, &mut body, OP_HAS_VARIABLE, 0);
+        }
+        current_ptr = inst.next.as_mut().map(|b| b.as_mut() as *mut Inst);
+    }
     block_join(matcher, body)
 }
 
@@ -1009,9 +1082,10 @@ fn get_opcode_flags(op: CompileOpcode) -> i32 {
 /// Get opcode flags from u16 opcode
 fn get_opcode_flags_u16(op: Opcode) -> i32 {
     match op {
-        CLOSURE_PARAM | CLOSURE_PARAM_REGULAR => OP_HAS_BINDING | OP_HAS_VARIABLE,
+        CLOSURE_PARAM | CLOSURE_PARAM_REGULAR => OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
         CLOSURE_CREATE => OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
         CLOSURE_CREATE_C => OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
+        CLOSURE_REF => OP_IS_CALL_PSEUDO | OP_HAS_BINDING,
         JUMP => OP_HAS_BRANCH,
         JUMP_F => OP_HAS_BRANCH,
         TRY_BEGIN => OP_HAS_BRANCH,
@@ -1243,12 +1317,19 @@ pub fn locfile_locate_with_args(
     }
 }
 /// Check if block is a single instruction
+/// Returns true if:
+/// - first and last both point to the same instruction (owned block), OR
+/// - first is None but last is Some (reference-only block used for binding)
 pub fn block_is_single(b: &Block) -> bool {
     if let Some(ref first) = b.first {
         if let Some(last_ptr) = b.last {
             let first_ptr = &**first as *const Inst;
             return first_ptr == last_ptr;
         }
+    } else if b.last.is_some() {
+        // Reference-only block: first is None but last points to an instruction
+        // This is used when we need to bind without taking ownership
+        return true;
     }
     false
 }
@@ -1292,13 +1373,15 @@ pub fn block_take(b: &mut Block) -> Option<Inst> {
     }
     Some(*first)
 }
-/// Take the last instruction from a block
-pub fn block_take_last(b: &mut Block) -> Option<Inst> {
+/// Take the last instruction from a block, preserving its heap location
+/// Returns Box<Inst> to avoid moving the instruction to a new heap address
+/// which would invalidate bound_by pointers
+pub fn block_take_last(b: &mut Block) -> Option<Box<Inst>> {
     if b.first.is_none() {
         return None;
     }
     if block_is_single(b) {
-        return b.first.take().map(|boxed| *boxed);
+        return b.first.take();
     }
     let mut current = &mut b.first;
     while let Some(ref mut node) = current {
@@ -1309,7 +1392,7 @@ pub fn block_take_last(b: &mut Block) -> Option<Inst> {
             if next_is_last {
                 let last = node.next.take();
                 b.last = Some(&mut **node as *mut Inst);
-                return last.map(|boxed| *boxed);
+                return last;
             }
         }
         current = &mut current.as_mut().unwrap().next;
@@ -1403,11 +1486,14 @@ pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
             } else if curr.bound_by.is_none() {
                 if let Some(ref sym) = curr.symbol {
                     if debug { eprintln!("  ERROR: {}/{} is not defined (op={})", sym, curr.nactuals, curr.op); }
-                    locfile_locate(
-                        &curr.locfile,
-                        &curr.source,
-                        &format!("jq: error: {}/{} is not defined", sym, curr.nactuals),
-                    );
+                    // Always print error even if locfile is None
+                    eprintln!("jq: error: {}/{} is not defined", sym, curr.nactuals);
+                } else {
+                    // No symbol - report the opcode so we can debug
+                    let op_name = opcode_describe(curr.op).name;
+                    if debug { eprintln!("  ERROR: unbound {} instruction (op={})", op_name, curr.op); }
+                    // Always print error even if locfile is None
+                    eprintln!("jq: error: unbound {} instruction", op_name);
                 }
                 if debug { eprintln!("  ERROR (no symbol): bound_by=None, op={}", curr.op); }
                 errors += 1;
@@ -1431,11 +1517,18 @@ pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
                         if i.op == CLOSURE_REF {
                             block_append(&mut callargs, inst_block(i_box));
                         } else if i.op == CLOSURE_CREATE {
+                            // IMPORTANT: In C, block is just {first,last} pointers - passing by value
+                            // shares the same instruction memory. In Rust, we must NOT clone because
+                            // the CLOSURE_REF must point to the actual instruction that goes to prelude.
+                            // Append the ORIGINAL instruction to prelude (not a clone).
                             let b_inst = inst_block(i_box);
-                            block_append(&mut prelude, b_inst.clone());
+                            block_append(&mut prelude, b_inst);
+                            // Now create CLOSURE_REF bound to the instruction we just appended.
+                            // Get a reference to the last instruction in prelude (what we just added).
+                            let binder_ptr = prelude.last.expect("prelude should have last after append");
                             block_append(
                                 &mut callargs,
-                                gen_op_bound(CLOSURE_REF, &b_inst),
+                                gen_op_bound_to_ptr(CLOSURE_REF, Some(binder_ptr)),
                             );
                         } else {
                             panic!("Unknown type of parameter");
@@ -1473,13 +1566,9 @@ pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
                     curr.op = CALL_BUILTIN;
                     curr.imm = InstImmediate::IntVal(actual_args + 1);
                     assert!(bound_by_op == CLOSURE_CREATE_C);
-                    desired_args = unsafe {
-                        if let InstImmediate::Cfunc(ref cfunc) = (*bound_by_ptr).imm {
-                            cfunc.nargs - 1
-                        } else {
-                            0
-                        }
-                    };
+                    // Use nformals which was set to nargs-1 in gen_cbinding
+                    // This avoids reading from imm which may have been overwritten to IntVal(idx)
+                    desired_args = unsafe { (*bound_by_ptr).nformals };
                     assert!(curr.arglist.first.is_none());
                 } else {
                     if debug {
@@ -1505,7 +1594,7 @@ pub fn block_bind_referenced(
     assert!(block_has_only_binders(& binder, bindflags));
     bindflags |= OP_HAS_BINDING as i32;
     while let Some(curr) = block_take_last(&mut binder) {
-        let mut b = inst_block(Box::new(curr));
+        let mut b = inst_block(curr);
         if block_bind_subblock(&mut b, &mut body, bindflags, 0) == 0 {
             block_free(b);
         } else {
@@ -1573,8 +1662,10 @@ fn gen_const_array(expr: &Block) -> Option<Block> {
     while let Some(inst) = current {
         if inst.op == FORK {
             commas += 1;
-            // Check if target is not a jump - simplified check
-            if jv_array_length(jv_copy(&a)) > 0 {
+            // C: if (i->imm.target == NULL || i->imm.target->op != JUMP || jv_array_length(jv_copy(a)) > 0)
+            let target_invalid = inst.target.is_none() ||
+                inst.target.map_or(true, |t| unsafe { (*t).op != JUMP });
+            if target_invalid || jv_array_length(jv_copy(&a)) > 0 {
                 normal = false;
                 break;
             }
@@ -1670,29 +1761,33 @@ pub fn block_bind_subblock_inner(
     }
 
     // Extract all needed values from binder in a limited scope
+    // Handle both owned blocks (first is Some) and reference-only blocks (first is None, last is Some)
     let (binder_ptr, binder_symbol, binder_nformals) = {
-        let binder_first = match binder.first.as_mut() {
-            Some(f) => f,
-            None => return 0,
+        let binder_inst: &mut Inst = if let Some(ref mut f) = binder.first {
+            f.as_mut()
+        } else if let Some(last_ptr) = binder.last {
+            unsafe { &mut *last_ptr }
+        } else {
+            return 0;
         };
-        let binder_op_flags = get_opcode_flags_u16(binder_first.op);
+        let binder_op_flags = get_opcode_flags_u16(binder_inst.op);
         if (binder_op_flags & bindflags) != (bindflags & !OP_BIND_WILDCARD) {
             return 0;
         }
-        let symbol = match binder_first.symbol.as_ref() {
+        let symbol = match binder_inst.symbol.as_ref() {
             Some(s) => s.clone(),
             None => return 0,
         };
         if break_distance < 0 {
             return 0;
         }
-        let nformals = binder_first.nformals;
-        let ptr = binder_first.as_mut() as *mut Inst;
+        let nformals = binder_inst.nformals;
+        let ptr = binder_inst as *mut Inst;
 
         // C line 314: binder.first->bound_by = binder.first
         // The binder binds to itself - this marks it as a definition
-        if binder_first.bound_by.is_none() {
-            binder_first.bound_by = Some(ptr);
+        if binder_inst.bound_by.is_none() {
+            binder_inst.bound_by = Some(ptr);
         }
 
         (ptr, symbol, nformals)
@@ -1707,6 +1802,11 @@ pub fn block_bind_subblock_inner(
             continue;
         }
         let flags = get_opcode_flags_u16(inst.op);
+        let debug_bind = std::env::var("DEBUG_BIND").is_ok();
+        if debug_bind && inst.symbol.as_ref().map_or(false, |s| s == "f") {
+            eprintln!("  bind_subblock_inner: inst op={} sym={:?} bound={:?} nact={} vs binder={:?} nformal={}",
+                inst.op, inst.symbol, inst.bound_by.is_some(), inst.nactuals, binder_symbol, binder_nformals);
+        }
         if (flags & bindflags) == (bindflags & !OP_BIND_WILDCARD)
             && inst.bound_by.is_none() && inst.symbol.is_some()
         {
@@ -1716,7 +1816,13 @@ pub fn block_bind_subblock_inner(
                     && break_distance <= 3 && inst_symbol.len() == 2
                     && inst_symbol.chars().nth(1)
                         == Some((b'1' + break_distance as u8) as char));
+            if debug_bind && inst_symbol == "f" {
+                eprintln!("    matches={} arity_ok={}", matches, inst.nactuals == -1 || inst.nactuals == binder_nformals);
+            }
             if matches && (inst.nactuals == -1 || inst.nactuals == binder_nformals) {
+                if debug_bind && inst_symbol == "f" {
+                    eprintln!("    BINDING f to {:?}", binder_ptr);
+                }
                 inst.bound_by = Some(binder_ptr);
                 nrefs += 1;
             }
@@ -1900,8 +2006,8 @@ pub fn block_count_actuals(b: &Block) -> i32 {
     }
     args
 }
-/// Opcode flags for binding
-const OP_BIND_WILDCARD: i32 = 0x100;
+/// Opcode flags for binding (must match C's bytecode.h: OP_BIND_WILDCARD = 2048)
+const OP_BIND_WILDCARD: i32 = 2048;
 /// Helper function to set object key
 pub fn jv_object_set(mut obj: Jv, key: Jv, value: Jv) -> Jv {
     obj
@@ -2050,13 +2156,22 @@ fn gen_op_pushk_under_internal(c: Jv) -> Block {
     inst_block(inst)
 }
 /// Bind a matcher block to a body
-pub fn bind_matcher(matcher: Block, body: Block) -> Block {
-    let mut current: Option<&Inst> = matcher.first.as_ref().map(|b| b.as_ref());
-    while let Some(inst) = current {
-        if (inst.op == STOREV || inst.op == STOREVN)
-            && inst.bound_by.is_none()
-        {}
-        current = inst.next.as_ref().map(|b| b.as_ref());
+/// This matches C's bind_matcher: for each STOREV/STOREVN that's unbound,
+/// bind it to the body with OP_HAS_VARIABLE
+pub fn bind_matcher(mut matcher: Block, mut body: Block) -> Block {
+    // Iterate through matcher looking for unbound STOREV/STOREVN
+    let mut current_ptr: Option<*mut Inst> = matcher.first.as_mut().map(|b| b.as_mut() as *mut Inst);
+    while let Some(ptr) = current_ptr {
+        let inst = unsafe { &mut *ptr };
+        if (inst.op == STOREV || inst.op == STOREVN) && inst.bound_by.is_none() {
+            // Create a reference-only binder block (first: None, last: Some(ptr))
+            let mut binder = Block {
+                first: None,
+                last: Some(ptr),
+            };
+            block_bind_subblock(&mut binder, &mut body, OP_HAS_VARIABLE, 0);
+        }
+        current_ptr = inst.next.as_mut().map(|b| b.as_mut() as *mut Inst);
     }
     block_join_internal(matcher, body)
 }
@@ -2174,6 +2289,10 @@ pub fn compile(
             }
             if curr.op == CLOSURE_CREATE {
                 if let Some(bound_ptr) = curr.bound_by {
+                    if bound_ptr != ptr && debug_compile {
+                        eprintln!("CLOSURE_CREATE mismatch: self={:?} bound_by={:?} symbol={:?}",
+                            ptr, bound_ptr, curr.symbol);
+                    }
                     assert!(bound_ptr == ptr, "curr.bound_by == curr");
                 }
                 curr.imm = InstImmediate::IntVal(bc.nsubfunctions);
@@ -2666,30 +2785,34 @@ pub fn gen_foreach(
     let state_var = gen_op_var_fresh(STOREV, "foreach");
     let state_var_ref1 = gen_op_unbound(LOADVN, "foreach");
     let state_var_ref2 = gen_op_unbound(STOREV, "foreach");
-    let output1 = gen_op_targetlater(JUMP);
-    let output2 = gen_op_targetlater(JUMP);
+    let output = gen_op_targetlater(JUMP);
+    // Save pointer to output instruction BEFORE joining it (matches gen_both pattern)
+    let output_ptr = output.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
 
     // Build loop_inner
     let inner1 = block_join(state_var_ref1, update);
     let inner2 = block_join(inner1, gen_op_simple(DUP));
     let inner3 = block_join(inner2, state_var_ref2);
     let inner4 = block_join(inner3, extract);
-    let loop_inner = block_join(inner4, output1);
+    let loop_inner = block_join(inner4, output);
 
     // Build loop_block
     let loop1 = block_join(gen_op_simple(DUPN), source);
     let loop_block = block_join(loop1, bind_alternation_matchers(matcher, loop_inner));
 
-    // Build foreach - need to duplicate loop_block logic
-    let loop_block2 = gen_noop(); // placeholder - actual loop is already built
+    // Build foreach
     let foreach1 = block_join(gen_op_simple(DUP), init);
     let foreach2 = block_join(foreach1, state_var);
     let foreach3 = block_join(foreach2, gen_op_target(FORK, &loop_block));
-    let foreach4 = block_join(foreach3, loop_block2);
+    let foreach4 = block_join(foreach3, loop_block);
     let foreach = block_join(foreach4, gen_op_simple(BACKTRACK));
 
-    // Note: inst_set_target would need the output block - simplified here
-    let _ = output2;
+    // C: inst_set_target(output, foreach); // make that JUMP go past the BACKTRACK
+    if let Some(ptr) = output_ptr {
+        unsafe {
+            (*ptr).imm = InstImmediate::Target(foreach.last);
+        }
+    }
     foreach
 }
 /// Take first instruction from block (returns raw pointer for compatibility)
@@ -2835,7 +2958,7 @@ pub fn block_bind_self(binder: Block, bindflags: i32) -> Block {
     let mut body = gen_noop();
     let mut binder = binder;
     while let Some(curr) = block_take_last(&mut binder) {
-        let mut b = inst_block(Box::new(curr));
+        let mut b = inst_block(curr);
         // Perform binding using the inner function
         let mut any_unbound = 0i32;
         let _nrefs = block_bind_subblock_inner(&mut any_unbound, &mut b, &mut body, bindflags, 0);
