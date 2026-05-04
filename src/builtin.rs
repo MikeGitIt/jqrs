@@ -2005,9 +2005,13 @@ pub fn f_atanh<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
     jv_free(input);
     ret
 }
-/// Helper to get current line from jq input (stub implementation)
-fn jq_util_input_get_current_line<T>(_jq: &JqState<T>) -> Jv {
-    Jv::null()
+/// Helper to get current line from jq input.
+fn jq_util_input_get_current_line<T>(jq: &JqState<T>) -> Jv {
+    if jq.input_filename.get_kind() == JvKind::String {
+        jv_number(jq.input_line as f64)
+    } else {
+        Jv::null()
+    }
 }
 /// Division operation for jv values
 /// Handles numeric division and string splitting
@@ -2693,10 +2697,21 @@ pub fn f_error<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
 /// Reads the next input value from the input callback
 pub fn f_input<T>(jq: &mut JqState<T>, input: Jv) -> Jv {
     drop(input);
-    // Simplified: callbacks require complex type handling
-    // In a full implementation, this would retrieve input from the input callback
-    let _ = jq;
-    Jv::invalid_with_msg(Jv::string("break"))
+    let Some(cb) = jq.input_cb else {
+        return Jv::invalid_with_msg(Jv::string("break"));
+    };
+    let Some(mut data) = jq.input_cb_data.take() else {
+        return Jv::invalid_with_msg(Jv::string("break"));
+    };
+    let value = cb(jq, data.as_mut());
+    jq.input_cb_data = Some(data);
+    let has_msg = value.get_kind() == JvKind::Invalid
+        && (value.kind_flags & crate::jv::JVP_PAYLOAD_ALLOCATED) != 0;
+    if crate::util::jv_is_valid(&value) || has_msg {
+        value
+    } else {
+        Jv::invalid_with_msg(Jv::string("break"))
+    }
 }
 /// Escapes special characters in a string based on escape mappings
 pub fn escape_string(input: Jv, escapings: &str) -> Jv {
@@ -3424,9 +3439,13 @@ fn timegm(tm: &Tm) -> i64 {
 pub fn jq_get_stderr_cb<T>(jq: &JqState<T>) -> (Option<JqMsgCb<T>>, Option<&T>) {
     (jq.stderr_cb, jq.stderr_cb_data.as_ref().map(|b| b.as_ref()))
 }
-/// Get current filename from jq util input (placeholder)
-pub fn jq_util_input_get_current_filename<T>(_jq: &JqState<T>) -> Jv {
-    Jv::default()
+/// Get current filename from jq util input.
+pub fn jq_util_input_get_current_filename<T>(jq: &JqState<T>) -> Jv {
+    if jq.input_filename.get_kind() == JvKind::String {
+        jv_copy(&jq.input_filename)
+    } else {
+        Jv::invalid()
+    }
 }
 /// Modulo operation for jq
 pub fn f_mod<T>(_jq: &mut JqState<T>, input: Jv, a: Jv, b: Jv) -> Jv {

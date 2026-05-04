@@ -100,7 +100,10 @@ use crate::bytecode::{
 use crate::locfile::{locfile_free, locfile_retain};
 // Note: UNKNOWN_LOCATION is defined locally in this file
 // Note: locfile_locate is defined in this file
-use crate::jv::{Jv, JvKind, jv_is_valid, jv_object_has, jv_object_get, jv_object_merge};
+use crate::jv::{
+    Jv, JvKind, jv_is_valid, jv_object_get, jv_object_iter, jv_object_iter_key,
+    jv_object_iter_next, jv_object_iter_valid, jv_object_merge,
+};
 use crate::jv_aux::jv_keys_unsorted;
 use crate::types::{
     Locfile, Location, CompileBlock, CompileInst,
@@ -134,6 +137,20 @@ fn dump_block(b: &Block, prefix: &str) {
             curr = inst.next.as_ref().map(|b| b.as_ref() as *const Inst);
         }
     }
+}
+
+fn object_has_key(object: &Jv, key: &str) -> bool {
+    let mut iter = jv_object_iter(object);
+    while jv_object_iter_valid(object, iter) {
+        let object_key = jv_object_iter_key(object, iter);
+        if object_key.get_kind() == JvKind::String
+            && crate::jv::jv_string_value(&object_key) == key
+        {
+            return true;
+        }
+        iter = jv_object_iter_next(object, iter);
+    }
+    false
 }
 
 /// Local OpcodeDesc for this module
@@ -1456,7 +1473,7 @@ pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
                         let new_env = make_env(env.clone());
                         curr.imm = InstImmediate::Constant(new_env.clone());
                         *env = new_env;
-                    } else if jv_object_has(args.clone(), Jv::string(sym)) != 0 {
+                    } else if object_has_key(&args, sym) {
                         curr.op = LOADK;
                         curr.imm = InstImmediate::Constant(
                             jv_object_get(&args, Jv::string(sym)),

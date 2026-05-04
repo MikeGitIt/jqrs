@@ -1028,6 +1028,8 @@ pub fn jq_init<T: Default>() -> Option<Box<JqState<T>>> {
         error_cb_data: None,
         input_cb: None,
         input_cb_data: None,
+        input_filename: jv_invalid(),
+        input_line: 0,
         debug_cb: None,
         debug_cb_data: None,
         stderr_cb: None,
@@ -2068,14 +2070,19 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
 
                 if jv_is_valid(&result) {
                     stack_push(jq_inner, result);
-                } else if crate::jv::jv_invalid_has_msg(jv_copy(&result)) != 0 {
+                } else if result.get_kind() == JvKind::Invalid
+                    && (result.kind_flags & crate::jv::JVP_PAYLOAD_ALLOCATED) != 0
+                {
                     set_error_jq(jq_inner, result);
                     match stack_restore_impl(jq_inner) {
                         Some(offset) => {
                             pc_offset = offset;
                             backtracking = true;
                         }
-                        None => return Jv::invalid(),
+                        None => {
+                            let error = std::mem::replace(&mut jq_inner.error, jv_null());
+                            return error;
+                        }
                     }
                 } else {
                     jv_free(result);
@@ -2603,8 +2610,16 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             crate::builtin::f_now(jq, Jv::null())
         }
         "debug" => crate::builtin::f_debug(jq, input),
+        "stderr" => crate::builtin::f_stderr(jq, input),
+        "halt" => crate::builtin::f_halt(jq, input),
+        "halt_error" => {
+            let code = if !args.is_empty() { args.remove(0) } else { Jv::number(5.0) };
+            crate::builtin::f_halt_error(jq, input, code)
+        }
         "input" => crate::builtin::f_input(jq, input),
-        "inputs" => crate::builtin::f_input(jq, input), // TODO: proper inputs
+        "inputs" => crate::builtin::f_input(jq, input),
+        "input_filename" => crate::builtin::f_current_filename(jq, input),
+        "input_line_number" => crate::builtin::f_current_line(jq, input),
         "infinite" => {
             jv_free(input);
             Jv::number(f64::INFINITY)
@@ -2742,7 +2757,8 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
                          "unique", "flatten", "getpath", "setpath", "delpaths",
                          "split", "startswith", "endswith", "ltrimstr", "rtrimstr",
                          "ascii_downcase", "ascii_upcase", "explode", "implode",
-                         "env", "now", "debug", "input", "infinite", "nan",
+                         "env", "now", "debug", "stderr", "input", "input_filename",
+                         "input_line_number", "infinite", "nan",
                          "isinfinite", "isnan", "isnormal", "isfinite",
                          "values", "nulls", "booleans", "numbers", "strings", "arrays", "objects",
                          "iterables", "scalars", "builtins"].iter() {
@@ -3215,6 +3231,8 @@ fn create_jq_state<T>() -> JqState<T> {
         error_cb_data: None,
         input_cb: None,
         input_cb_data: None,
+        input_filename: Jv::invalid(),
+        input_line: 0,
         debug_cb: None,
         debug_cb_data: None,
         stderr_cb: None,

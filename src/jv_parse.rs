@@ -97,7 +97,7 @@ const MAX_PARSING_DEPTH: usize = 256;
 pub const JV_PARSE_STREAMING: i32 = 1;
 pub const JV_PARSE_STREAM_ERRORS: i32 = 2;
 /// Parser flags
-pub const JV_PARSE_SEQ: i32 = 1;
+pub const JV_PARSE_SEQ: i32 = 4;
 /// Create a new parser
 pub fn jv_parser_new(flags: i32) -> Box<ExtendedJvParser> {
     let mut p = Box::new(ExtendedJvParser::default());
@@ -721,13 +721,9 @@ pub fn check_literal(p: &mut ExtendedJvParser) -> Option<&'static str> {
                 return Some("Invalid literal");
             }
         }
-        b'n' => {
-            if p.base.tokenpos >= 2 && p.base.tokenbuf[1] == b'u' {
-                if p.base.tokenpos == 4 && &p.base.tokenbuf[0..4] == b"null" {
-                    value(p, Jv::null())
-                } else {
-                    return Some("Invalid literal");
-                }
+        b'n' if p.base.tokenpos > 1 && p.base.tokenbuf[1] == b'u' => {
+            if p.base.tokenpos == 4 && &p.base.tokenbuf[0..4] == b"null" {
+                value(p, Jv::null())
             } else {
                 return Some("Invalid literal");
             }
@@ -1338,8 +1334,9 @@ const RS_CHAR: char = '\x1E';
 const OK: Option<&'static str> = None;
 /// Parser flags
 pub mod flags {
-    pub const JV_PARSE_SEQ: i32 = 1;
-    pub const JV_PARSE_STREAMING: i32 = 2;
+    pub const JV_PARSE_STREAMING: i32 = 1;
+    pub const JV_PARSE_STREAM_ERRORS: i32 = 2;
+    pub const JV_PARSE_SEQ: i32 = 4;
 }
 // /// Free a Jv value (no-op in Rust due to automatic memory management)
 // pub fn jv_free(_v: Jv) {}

@@ -2,11 +2,13 @@
 //!
 //! Contains 1 transpiled functions:
 //! - jv_load_file:6498013073032868138:./src/jv_file.c
-use std::fs::File;
-use std::io::{Read, BufReader};
 use std::path::Path;
-use crate::jv_parse::{jv_parser_new, jv_parser_set_buf, jv_parser_next, jv_parser_free, ExtendedJvParser};
+use crate::jv_parse::jv_parser_new;
 use crate::types::*;
+use crate::util::{
+    jq_util_input_add_input, jq_util_input_errors, jq_util_input_free, jq_util_input_init,
+    jq_util_input_next_input, jq_util_input_set_parser,
+};
 /// Check if a jv value is valid
 #[inline]
 pub fn jv_is_valid(x: &Jv) -> bool {
@@ -14,13 +16,7 @@ pub fn jv_is_valid(x: &Jv) -> bool {
 }
 /// Create an invalid jv with an error message
 fn jv_invalid_with_msg(msg: Jv) -> Jv {
-    Jv {
-        kind_flags: JvKind::Invalid as u8,
-        pad_: 0,
-        offset: 0,
-        size: msg.size,
-        u: msg.u,
-    }
+    crate::jv::jv_invalid_with_msg(msg)
 }
 /// Create a formatted string jv
 fn jv_string_fmt(fmt: &str, args: &[&str]) -> Jv {
@@ -30,27 +26,15 @@ fn jv_string_fmt(fmt: &str, args: &[&str]) -> Jv {
             result.replace_range(pos..pos + 2, arg);
         }
     }
-    jv_string(&result)
+    crate::jv::jv_string(&result)
 }
 /// Create a string jv
 fn jv_string(s: &str) -> Jv {
-    Jv {
-        kind_flags: JvKind::String as u8,
-        pad_: 0,
-        offset: 0,
-        size: s.len() as i32,
-        u: 0,
-    }
+    crate::jv::jv_string(s)
 }
 /// Create an empty array jv
 fn jv_array() -> Jv {
-    Jv {
-        kind_flags: JvKind::Array as u8,
-        pad_: 0,
-        offset: 0,
-        size: 0,
-        u: 0,
-    }
+    crate::jv::jv_array()
 }
 /// Append a buffer to a string jv
 fn jv_string_append_buf(s: Jv, buf: &[u8], n: usize) -> Jv {
@@ -62,7 +46,8 @@ fn jv_array_append(arr: Jv, value: Jv) -> Jv {
 }
 /// Check if invalid jv has a message
 fn jv_invalid_has_msg(v: Jv) -> bool {
-    (v.kind_flags & 0x0F) == JvKind::Invalid as u8 && v.size > 0
+    v.get_kind() == JvKind::Invalid
+        && (v.kind_flags & crate::jv::JVP_PAYLOAD_ALLOCATED) != 0
 }
 /// Copy a jv value
 fn jv_copy(v: &Jv) -> Jv {
@@ -110,77 +95,41 @@ pub fn jv_load_file(filename: &str, raw: bool) -> Jv {
             jv_string_fmt("Could not open %s: %s", &[filename, "It's a directory"]),
         );
     }
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            return jv_invalid_with_msg(
-                jv_string_fmt("Could not open %s: %s", &[filename, &e.to_string()]),
-            );
-        }
-    };
-    let mut reader = BufReader::new(file);
-    let mut parser: Option<Box<ExtendedJvParser>> = None;
-    let mut data = if raw {
-        jv_string("")
-    } else {
-        parser = Some(jv_parser_new(0));
-        jv_array()
-    };
-    const MAX_UTF8_LEN: usize = 4;
-    let mut buf = vec![0u8; 4096 + MAX_UTF8_LEN];
-    let mut read_error = false;
-    loop {
-        let n = match reader.read(&mut buf[..4096]) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => {
-                read_error = true;
-                break;
+    if raw {
+        let buf = match std::fs::read(path) {
+            Ok(buf) => buf,
+            Err(e) => {
+                return jv_invalid_with_msg(
+                    jv_string_fmt("Error reading from %s: %s", &[filename, &e.to_string()]),
+                );
             }
         };
-        let mut total_read = n;
-        if n > 0 {
-            let mut additional_len = 0i32;
-            if jvp_utf8_backtrack(&buf[n - 1], &buf[..n], &mut additional_len)
-                && additional_len > 0
-            {
-                if let Ok(extra) = reader.read(&mut buf[n..n + additional_len as usize])
-                {
-                    total_read += extra;
-                }
-            }
-        }
-        if raw {
-            data = jv_string_append_buf(data, &buf[..total_read], total_read);
+        return jv_string_append_buf(jv_string(""), &buf, buf.len());
+    }
+
+    let mut input_state = Some(jq_util_input_init(None, None));
+    let state = input_state.as_mut().unwrap();
+    jq_util_input_add_input(state.as_mut(), filename);
+    jq_util_input_set_parser(state.as_mut(), Some(jv_parser_new(0)), false);
+    let mut data = jv_array();
+    loop {
+        let value = jq_util_input_next_input(state.as_mut());
+        if jv_is_valid(&value) {
+            data = jv_array_append(data, value);
+        } else if jv_invalid_has_msg(jv_copy(&value)) {
+            jv_free(data);
+            jq_util_input_free(&mut input_state);
+            return value;
         } else {
-            if let Some(ref mut p) = parser {
-                jv_parser_set_buf(p, &buf[..total_read], total_read as i32, true);
-                loop {
-                    let value = jv_parser_next(p);
-                    if jv_is_valid(&value) {
-                        data = jv_array_append(data, value);
-                    } else {
-                        if jv_invalid_has_msg(jv_copy(&value)) {
-                            jv_free(data);
-                            data = value;
-                            read_error = true;
-                        }
-                        break;
-                    }
-                }
-                if read_error {
-                    break;
-                }
-            }
+            break;
         }
     }
-    if let Some(p) = parser {
-        jv_parser_free(p);
-    }
-    if read_error {
+    if jq_util_input_errors(state.as_ref()) != 0 {
         jv_free(data);
+        jq_util_input_free(&mut input_state);
         return jv_invalid_with_msg(jv_string_fmt("Error reading from %s", &[filename]));
     }
+    jq_util_input_free(&mut input_state);
     data
 }
 #[cfg(test)]

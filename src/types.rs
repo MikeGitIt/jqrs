@@ -648,6 +648,9 @@ pub struct JqState<T = ()> {
     /// Input callback
     pub input_cb: Option<JqInputCb<T>>,
     pub input_cb_data: Option<Box<T>>,
+    /// Current input location for input_filename/input_line_number builtins
+    pub input_filename: Jv,
+    pub input_line: usize,
     /// Debug callback
     pub debug_cb: Option<JqMsgCb<T>>,
     pub debug_cb_data: Option<Box<T>>,
@@ -705,6 +708,8 @@ impl<T> Default for JqState<T> {
             error_cb_data: None,
             input_cb: None,
             input_cb_data: None,
+            input_filename: Jv::invalid(),
+            input_line: 0,
             debug_cb: None,
             debug_cb_data: None,
             stderr_cb: None,

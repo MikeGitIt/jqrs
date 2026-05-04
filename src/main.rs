@@ -10,47 +10,53 @@
 //! - die:4605565059772087902:./src/main.c
 //! - process:10692635711031878123:./src/main.c
 use std::env;
+use std::cell::RefCell;
 use std::io::{self, Write, IsTerminal};
 use std::path::Path;
 use std::process as std_process;
+use std::rc::Rc;
 use jq_with_autobuild::jv::{
-    Jv, JvKind, jv_string_value, jv_number_value, jv_invalid_get_msg, jv_invalid_has_msg, jv_object_has,
+    Jv, JvKind, jv_string_value, jv_number_value, jv_invalid_get_msg,
+    jv_object_iter, jv_object_iter_key, jv_object_iter_next, jv_object_iter_valid,
 };
-use jq_with_autobuild::jv_print::{jv_dump, jv_dumpf, jv_dump_string};
+use jq_with_autobuild::jv_file::jv_load_file;
+use jq_with_autobuild::jv_print::{jv_dumpf, jv_dump_string, jq_set_colors};
 use jq_with_autobuild::jv_parse::jv_parse;
 use jq_with_autobuild::execute::{
     jq_init, jq_start, jq_next, jq_halted, jq_get_exit_code, jq_get_error_message,
-    jq_compile_args, jq_set_attr, jq_set_debug_cb, jq_set_stderr_cb,
+    jq_compile_args, jq_set_attr, jq_set_debug_cb, jq_set_input_cb, jq_set_stderr_cb,
     jq_dump_disassembly, jq_teardown,
 };
-use jq_with_autobuild::types::JqState;
+use jq_with_autobuild::jq_test::jq_testsuite;
+use jq_with_autobuild::types::{JqState, JqUtilInputState};
 use jq_with_autobuild::util::{
     jq_util_input_init, jq_util_input_add_input, jq_util_input_errors,
     jq_util_input_next_input, jq_util_input_set_parser, jq_util_input_free,
-    jv_is_valid,
+    jq_realpath, jv_is_valid,
 };
-use jq_with_autobuild::jv_parse::{jv_parser_new, jv_parser_free, ExtendedJvParser};
+use jq_with_autobuild::jv_parse::jv_parser_new;
 pub const JQ_OK: i32 = 0;
-pub const JQ_OK_NO_OUTPUT: i32 = -1;
-pub const JQ_OK_NULL_KIND: i32 = -2;
-pub const JQ_ERROR_SYSTEM: i32 = 5;
+pub const JQ_OK_NULL_KIND: i32 = -1;
+pub const JQ_ERROR_SYSTEM: i32 = 2;
 pub const JQ_ERROR_COMPILE: i32 = 3;
-pub const JQ_ERROR_UNKNOWN: i32 = 1;
+pub const JQ_OK_NO_OUTPUT: i32 = -4;
+pub const JQ_ERROR_UNKNOWN: i32 = 5;
 pub const SLURP: i32 = 1;
-pub const RAW_OUTPUT: i32 = 2;
-pub const RAW_NO_LF: i32 = 4;
-pub const RAW_OUTPUT0: i32 = 8;
-pub const ASCII_OUTPUT: i32 = 16;
-pub const COLOR_OUTPUT: i32 = 32;
-pub const NO_COLOR_OUTPUT: i32 = 64;
-pub const SORTED_OUTPUT: i32 = 128;
-pub const RAW_INPUT: i32 = 256;
-pub const PROVIDE_NULL: i32 = 512;
-pub const FROM_FILE: i32 = 1024;
-pub const EXIT_STATUS: i32 = 2048;
-pub const SEQ: i32 = 4096;
-pub const UNBUFFERED_OUTPUT: i32 = 8192;
-pub const DUMP_DISASM: i32 = 16384;
+pub const RAW_INPUT: i32 = 2;
+pub const PROVIDE_NULL: i32 = 4;
+pub const RAW_OUTPUT: i32 = 8;
+pub const RAW_OUTPUT0: i32 = 16;
+pub const ASCII_OUTPUT: i32 = 32;
+pub const COLOR_OUTPUT: i32 = 64;
+pub const NO_COLOR_OUTPUT: i32 = 128;
+pub const SORTED_OUTPUT: i32 = 256;
+pub const FROM_FILE: i32 = 512;
+pub const RAW_NO_LF: i32 = 1024;
+pub const UNBUFFERED_OUTPUT: i32 = 2048;
+pub const EXIT_STATUS: i32 = 4096;
+pub const SEQ: i32 = 16384;
+pub const RUN_TESTS: i32 = 32768;
+pub const DUMP_DISASM: i32 = 65536;
 pub const JQ_DEBUG_TRACE: i32 = 1;
 pub const JQ_DEBUG_TRACE_ALL: i32 = 2;
 pub const JV_PRINT_PRETTY: i32 = 1;
@@ -62,7 +68,14 @@ pub const JV_PRINT_ISATTY: i32 = 32;
 pub const JV_PARSE_STREAMING: i32 = 1;
 pub const JV_PARSE_STREAM_ERRORS: i32 = 2;
 pub const JV_PARSE_SEQ: i32 = 4;
-const JQ_VERSION: &str = "1.7.1-57-gba741e5";
+const JQ_VERSION: &str = "1.7.1-57-gba741e5-dirty";
+const JQ_CONFIG: &str = "";
+type SharedInputState = Rc<RefCell<Box<JqUtilInputState>>>;
+#[derive(Clone, Default)]
+pub struct CliCallbackData {
+    dumpopts: i32,
+    input_state: Option<SharedInputState>,
+}
 static mut PROGNAME: Option<String> = None;
 fn get_progname() -> &'static str {
     unsafe { PROGNAME.as_deref().unwrap_or("jq") }
@@ -71,6 +84,97 @@ fn set_progname(name: String) {
     unsafe {
         PROGNAME = Some(name);
     }
+}
+fn jq_exit_with_status(ret: i32) -> ! {
+    std_process::exit(ret.abs());
+}
+fn jq_exit(ret: i32) -> ! {
+    std_process::exit(if ret > 0 { ret } else { 0 });
+}
+fn jq_exit_for_options(ret: i32, options: i32) -> ! {
+    if (options & EXIT_STATUS) != 0 {
+        jq_exit_with_status(ret);
+    }
+    jq_exit(ret);
+}
+fn dirname_jv(path: &str) -> Jv {
+    let dirname = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    Jv::string(&dirname)
+}
+fn input_position(input_state: Option<&SharedInputState>) -> String {
+    let Some(input_state) = input_state else {
+        return "<unknown>".to_string();
+    };
+    let state = input_state.borrow();
+    if state.current_filename.get_kind() != JvKind::String {
+        return "<unknown>".to_string();
+    }
+    format!("{}:{}", jv_string_value(&state.current_filename), state.current_line)
+}
+fn invalid_has_msg(value: &Jv) -> bool {
+    !jv_is_valid(value)
+        && value.get_kind() == JvKind::Invalid
+        && (value.kind_flags & jq_with_autobuild::jv::JVP_PAYLOAD_ALLOCATED) != 0
+}
+fn object_has_key(object: &Jv, key: &str) -> bool {
+    let mut iter = jv_object_iter(object);
+    while jv_object_iter_valid(object, iter) {
+        let object_key = jv_object_iter_key(object, iter);
+        if object_key.get_kind() == JvKind::String && jv_string_value(&object_key) == key {
+            return true;
+        }
+        iter = jv_object_iter_next(object, iter);
+    }
+    false
+}
+struct OutputTracker<W: Write> {
+    inner: W,
+    first_error: Option<io::Error>,
+}
+impl<W: Write> OutputTracker<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            first_error: None,
+        }
+    }
+    fn record_error(&mut self, err: &io::Error) {
+        if self.first_error.is_none() {
+            self.first_error = Some(io::Error::new(err.kind(), err.to_string()));
+        }
+    }
+    fn take_error(&mut self) -> Option<io::Error> {
+        self.first_error.take()
+    }
+}
+impl<W: Write> Write for OutputTracker<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.write(buf) {
+            Ok(n) => Ok(n),
+            Err(err) => {
+                self.record_error(&err);
+                Err(err)
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.flush() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.record_error(&err);
+                Err(err)
+            }
+        }
+    }
+}
+fn sync_jq_input_position<T>(jq: &mut JqState<T>, input_state: &SharedInputState) {
+    let state = input_state.borrow();
+    jq.input_filename = state.current_filename.clone();
+    jq.input_line = state.current_line;
 }
 /// Compute dump options from indent value
 fn compute_dumpopts(indent: i32) -> i32 {
@@ -83,36 +187,42 @@ fn compute_dumpopts(indent: i32) -> i32 {
     }
 }
 /// Write to output stream
-pub fn priv_fwrite(s: &str, out: &mut dyn Write, is_tty: bool) {
-    let _ = out.write_all(s.as_bytes());
+pub fn priv_fwrite(s: &str, out: &mut dyn Write, is_tty: bool) -> io::Result<()> {
+    out.write_all(s.as_bytes())?;
     if is_tty {
-        let _ = out.flush();
+        out.flush()?;
     }
+    Ok(())
 }
 /// Process a single input value through jq
-pub fn process<T>(
+pub fn process<T, W: Write>(
     jq: &mut JqState<T>,
     value: Jv,
     flags: i32,
     dumpopts: i32,
     options: i32,
+    stdout: &mut W,
+    input_state: Option<&SharedInputState>,
 ) -> i32 {
     let mut ret = JQ_OK_NO_OUTPUT;
-    let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     let is_tty = (dumpopts & JV_PRINT_ISATTY) != 0;
     jq_start(jq, value, flags);
     loop {
         let result = jq_next(jq);
         if !jv_is_valid(&result) {
-            // Only print error if there's actually a message attached (like C code)
-            if jv_invalid_has_msg(result.clone()) != 0 {
-                let msg = jv_invalid_get_msg(result.clone());
+            if invalid_has_msg(&result) {
+                let msg = jv_invalid_get_msg(result);
+                let pos = input_position(input_state);
                 if msg.get_kind() == JvKind::String {
-                    eprintln!("jq: error: {}", jv_string_value(&msg));
+                    eprintln!("jq: error (at {}): {}", pos, jv_string_value(&msg));
                 } else {
                     let msg_str = jv_dump_string(msg.clone(), 0);
-                    eprintln!("jq: error (not a string): {}", jv_string_value(&msg_str));
+                    eprintln!(
+                        "jq: error (at {}) (not a string): {}",
+                        pos,
+                        jv_string_value(&msg_str)
+                    );
                 }
                 ret = JQ_ERROR_UNKNOWN;
             }
@@ -120,22 +230,21 @@ pub fn process<T>(
         }
         if (options & RAW_OUTPUT) != 0 && result.get_kind() == JvKind::String {
             if (options & ASCII_OUTPUT) != 0 {
-                jv_dumpf(result.clone(), &mut stdout, JV_PRINT_ASCII);
+                jv_dumpf(result.clone(), stdout, JV_PRINT_ASCII);
             } else if (options & RAW_OUTPUT0) != 0 {
                 let s = jv_string_value(&result);
                 if s.contains('\0') {
-                    let _err_msg = Jv::invalid_with_msg(
-                        Jv::string(
-                            "Cannot dump a string containing NUL with --raw-output0 option",
-                        ),
+                    eprintln!(
+                        "jq: error (at {}): Cannot dump a string containing NUL with --raw-output0 option",
+                        input_position(input_state)
                     );
                     ret = JQ_ERROR_UNKNOWN;
                     break;
                 }
-                priv_fwrite(s, &mut stdout, is_tty);
+                let _ = priv_fwrite(s, stdout, is_tty);
             } else {
                 let s = jv_string_value(&result);
-                priv_fwrite(s, &mut stdout, is_tty);
+                let _ = priv_fwrite(s, stdout, is_tty);
             }
             ret = JQ_OK;
         } else {
@@ -144,15 +253,15 @@ pub fn process<T>(
                 _ => ret = JQ_OK,
             }
             if (options & SEQ) != 0 {
-                priv_fwrite("\x1e", &mut stdout, is_tty);
+                let _ = priv_fwrite("\x1e", stdout, is_tty);
             }
-            jv_dump(result.clone(), dumpopts);
+            jv_dumpf(result.clone(), stdout, dumpopts);
         }
         if (options & RAW_NO_LF) == 0 {
-            priv_fwrite("\n", &mut stdout, is_tty);
+            let _ = priv_fwrite("\n", stdout, is_tty);
         }
         if (options & RAW_OUTPUT0) != 0 {
-            priv_fwrite("\0", &mut stdout, is_tty);
+            let _ = priv_fwrite("\0", stdout, is_tty);
         }
         if (options & UNBUFFERED_OUTPUT) != 0 {
             let _ = stdout.flush();
@@ -171,7 +280,7 @@ pub fn process<T>(
         match error_message.get_kind() {
             JvKind::String => {
                 let s = jv_string_value(&error_message);
-                priv_fwrite(s, &mut stderr, is_tty);
+                let _ = priv_fwrite(s, &mut stderr, is_tty);
             }
             JvKind::Null => {}
             _ => {
@@ -259,46 +368,49 @@ pub fn usage(code: i32, keep_it_short: bool) {
         eprintln!("For listing the command options, use {} --help.", progname);
     } else if code == 0 {
         println!(
-            "Command options:\n\
-            -n, --null-input          use `null` as the single input value;\n\
-            -R, --raw-input           read each line as string instead of JSON;\n\
-            -s, --slurp               read all inputs into an array and use it as\n\
-                                        the single input value;\n\
-            -c, --compact-output      compact instead of pretty-printed output;\n\
-            -r, --raw-output          output strings without escapes and quotes;\n\
-                --raw-output0         implies -r and output NUL after each output;\n\
-            -j, --join-output         implies -r and output without newline after\n\
-                                        each output;\n\
-            -a, --ascii-output        output strings by only ASCII characters\n\
-                                        using escape sequences;\n\
-            -S, --sort-keys           sort keys of each object on output;\n\
-            -C, --color-output        colorize JSON output;\n\
-            -M, --monochrome-output   disable colored output;\n\
-                --tab                 use tabs for indentation;\n\
-                --indent n            use n spaces for indentation (max 7 spaces);\n\
-                --unbuffered          flush output stream after each output;\n\
-                --stream              parse the input value in streaming fashion;\n\
-                --stream-errors       implies --stream and report parse error as\n\
-                                        an array;\n\
-                --seq                 parse input/output as application/json-seq;\n\
-            -f, --from-file file      load filter from the file;\n\
-            -L directory              search modules from the directory;\n\
-                --arg name value      set $name to the string value;\n\
-                --argjson name value  set $name to the JSON value;\n\
-                --slurpfile name file set $name to an array of JSON values read\n\
-                                        from the file;\n\
-                --rawfile name file   set $name to string contents of file;\n\
-                --args                consume remaining arguments as positional\n\
-                                        string values;\n\
-                --jsonargs            consume remaining arguments as positional\n\
-                                        JSON values;\n\
-            -e, --exit-status         set exit status code based on the output;\n\
-            -V, --version             show the version;\n\
-            --build-configuration     show jq's build configuration;\n\
-            -h, --help                show the help;\n\
-            --                        terminates argument processing;\n\n\
-            Named arguments are also available as $ARGS.named[], while\n\
-            positional arguments are available as $ARGS.positional[]."
+            "{}",
+            concat!(
+                "Command options:\n",
+                "  -n, --null-input          use `null` as the single input value;\n",
+                "  -R, --raw-input           read each line as string instead of JSON;\n",
+                "  -s, --slurp               read all inputs into an array and use it as\n",
+                "                            the single input value;\n",
+                "  -c, --compact-output      compact instead of pretty-printed output;\n",
+                "  -r, --raw-output          output strings without escapes and quotes;\n",
+                "      --raw-output0         implies -r and output NUL after each output;\n",
+                "  -j, --join-output         implies -r and output without newline after\n",
+                "                            each output;\n",
+                "  -a, --ascii-output        output strings by only ASCII characters\n",
+                "                            using escape sequences;\n",
+                "  -S, --sort-keys           sort keys of each object on output;\n",
+                "  -C, --color-output        colorize JSON output;\n",
+                "  -M, --monochrome-output   disable colored output;\n",
+                "      --tab                 use tabs for indentation;\n",
+                "      --indent n            use n spaces for indentation (max 7 spaces);\n",
+                "      --unbuffered          flush output stream after each output;\n",
+                "      --stream              parse the input value in streaming fashion;\n",
+                "      --stream-errors       implies --stream and report parse error as\n",
+                "                            an array;\n",
+                "      --seq                 parse input/output as application/json-seq;\n",
+                "  -f, --from-file file      load filter from the file;\n",
+                "  -L directory              search modules from the directory;\n",
+                "      --arg name value      set $name to the string value;\n",
+                "      --argjson name value  set $name to the JSON value;\n",
+                "      --slurpfile name file set $name to an array of JSON values read\n",
+                "                            from the file;\n",
+                "      --rawfile name file   set $name to string contents of file;\n",
+                "      --args                consume remaining arguments as positional\n",
+                "                            string values;\n",
+                "      --jsonargs            consume remaining arguments as positional\n",
+                "                            JSON values;\n",
+                "  -e, --exit-status         set exit status code based on the output;\n",
+                "  -V, --version             show the version;\n",
+                "  --build-configuration     show jq's build configuration;\n",
+                "  -h, --help                show the help;\n",
+                "  --                        terminates argument processing;\n\n",
+                "Named arguments are also available as $ARGS.named[], while\n",
+                "positional arguments are available as $ARGS.positional[]."
+            )
         );
     }
     std_process::exit(code);
@@ -307,30 +419,44 @@ pub fn usage(code: i32, keep_it_short: bool) {
 pub fn die() -> ! {
     let progname = get_progname();
     eprintln!("Use {} --help for help with command-line options,", progname);
-    eprintln!("or see the jq manpage, or online docs at https://jqlang.github.io/jq");
+    eprintln!("or see the jq manpage, or online docs  at https://jqlang.github.io/jq");
     std_process::exit(2);
 }
 /// Debug callback
-pub fn debug_cb(data: &mut i32, input: Jv) {
-    let dumpopts = *data;
+pub fn debug_cb(data: &mut CliCallbackData, input: Jv) {
+    let dumpopts = data.dumpopts;
     let mut stderr = io::stderr();
     let arr = Jv::array().array_append(Jv::string("DEBUG:")).array_append(input);
     jv_dumpf(arr, &mut stderr, dumpopts & !JV_PRINT_PRETTY);
     eprintln!();
 }
 /// Stderr callback
-pub fn stderr_cb(data: &mut i32, input: Jv) {
-    let dumpopts = *data;
+pub fn stderr_cb(data: &mut CliCallbackData, input: Jv) {
+    let dumpopts = data.dumpopts;
     let mut stderr = io::stderr();
     let is_tty = (dumpopts & JV_PRINT_ISATTY) != 0;
     if input.get_kind() == JvKind::String {
         let s = jv_string_value(&input);
-        priv_fwrite(s, &mut stderr, is_tty);
+        let _ = priv_fwrite(s, &mut stderr, is_tty);
     } else {
         let msg_str = jv_dump_string(input.clone(), 0);
         let s = jv_string_value(&msg_str);
         eprint!("{}", s);
     }
+}
+/// Input callback for jq `input`/`inputs` builtins.
+pub fn input_cb(jq: &mut JqState<CliCallbackData>, data: &mut CliCallbackData) -> Jv {
+    let Some(input_state) = &data.input_state else {
+        return Jv::invalid();
+    };
+    let (value, filename, line) = {
+        let mut state = input_state.borrow_mut();
+        let value = jq_util_input_next_input(state.as_mut());
+        (value, state.current_filename.clone(), state.current_line)
+    };
+    jq.input_filename = filename;
+    jq.input_line = line;
+    value
 }
 /// Main entry point
 pub fn main() {
@@ -351,17 +477,17 @@ pub fn main() {
     let mut program_arguments = Jv::object();
     let mut program: Option<String> = None;
     let mut dumpopts = compute_dumpopts(2);
-    let mut jq_opt: Option<Box<JqState<i32>>> = match jq_init() {
+    let mut jq_opt: Option<Box<JqState<CliCallbackData>>> = match jq_init() {
         Some(jq) => Some(jq),
         None => {
             eprintln!("jq_init failed");
             ret = JQ_ERROR_SYSTEM;
-            std_process::exit(ret.max(0));
+            jq_exit(ret);
         }
     };
     let jq = jq_opt.as_mut().unwrap().as_mut();
     // Initialize input state for handling files - C: jq_util_input_init(NULL, NULL)
-    let mut input_state = jq_util_input_init(None, None);
+    let input_state = Rc::new(RefCell::new(jq_util_input_init(None, None)));
     let mut further_args_are_strings = false;
     let mut further_args_are_json = false;
     let mut args_done = false;
@@ -387,7 +513,8 @@ pub fn main() {
                 jq_args = jq_args.array_append(v);
             } else {
                 // C: jq_util_input_add_input(input_state, argv[i])
-                jq_util_input_add_input(&mut input_state, arg);
+                let mut state = input_state.borrow_mut();
+                jq_util_input_add_input(state.as_mut(), arg);
                 nfiles += 1;
             }
         } else if arg == "--" {
@@ -398,16 +525,14 @@ pub fn main() {
                     lib_search_paths = Some(Jv::array());
                 }
                 if arg.len() > 2 {
-                    let path = Jv::string(&arg[2..]);
-                    lib_search_paths = Some(
-                        lib_search_paths.unwrap().array_append(path),
-                    );
+                    let path = jq_realpath(Jv::string(&arg[2..]));
+                    let paths = lib_search_paths.take().unwrap_or_else(Jv::array);
+                    lib_search_paths = Some(paths.array_append(path));
                 } else if i + 1 < argc as usize {
                     i += 1;
-                    let path = Jv::string(&args[i]);
-                    lib_search_paths = Some(
-                        lib_search_paths.unwrap().array_append(path),
-                    );
+                    let path = jq_realpath(Jv::string(&args[i]));
+                    let paths = lib_search_paths.take().unwrap_or_else(Jv::array);
+                    lib_search_paths = Some(paths.array_append(path));
                 } else {
                     eprintln!(
                         "-L takes a parameter: (e.g. -L /search/path or -L/search/path)"
@@ -579,7 +704,7 @@ pub fn main() {
                 }
                 let name = &args[i + 1];
                 let value = &args[i + 2];
-                if jv_object_has(program_arguments.clone(), Jv::string(name)) == 0 {
+                if !object_has_key(&program_arguments, name) {
                     program_arguments = program_arguments
                         .object_set(Jv::string(name), Jv::string(value));
                 }
@@ -596,7 +721,7 @@ pub fn main() {
                 }
                 let name = &args[i + 1];
                 let json_text = &args[i + 2];
-                if jv_object_has(program_arguments.clone(), Jv::string(name)) == 0 {
+                if !object_has_key(&program_arguments, name) {
                     let v = jv_parse(json_text);
                     if !jv_is_valid(&v) {
                         eprintln!(
@@ -606,6 +731,42 @@ pub fn main() {
                     }
                     program_arguments = program_arguments
                         .object_set(Jv::string(name), v);
+                }
+                i += 3;
+                continue;
+            }
+            if isoption(arg, None, "rawfile", &mut short_opts)
+                || isoption(arg, None, "slurpfile", &mut short_opts)
+            {
+                let raw = isoption(arg, None, "rawfile", &mut short_opts);
+                let which = if raw { "rawfile" } else { "slurpfile" };
+                if i + 2 >= argc as usize {
+                    eprintln!(
+                        "{}: --{} takes two parameters (e.g. --{} varname filename)",
+                        get_progname(),
+                        which,
+                        which
+                    );
+                    die();
+                }
+                let name = &args[i + 1];
+                let filename = &args[i + 2];
+                if !object_has_key(&program_arguments, name) {
+                    let data = jv_load_file(filename, raw);
+                    if !jv_is_valid(&data) {
+                        let msg = jv_invalid_get_msg(data);
+                        eprintln!(
+                            "{}: Bad JSON in --{} {} {}: {}",
+                            get_progname(),
+                            which,
+                            name,
+                            filename,
+                            jv_string_value(&msg)
+                        );
+                        ret = JQ_ERROR_SYSTEM;
+                        jq_exit_for_options(ret, options);
+                    }
+                    program_arguments = program_arguments.object_set(Jv::string(name), data);
                 }
                 i += 3;
                 continue;
@@ -632,11 +793,23 @@ pub fn main() {
             }
             if isoption(arg, Some('V'), "version", &mut short_opts) {
                 println!("jq-{}", JQ_VERSION);
-                std_process::exit(JQ_OK);
+                jq_exit(JQ_OK);
             }
             if isoption(arg, None, "build-configuration", &mut short_opts) {
-                println!();
-                std_process::exit(JQ_OK);
+                println!("{}", JQ_CONFIG);
+                jq_exit(JQ_OK);
+            }
+            if isoption(arg, None, "run-tests", &mut short_opts) {
+                options |= RUN_TESTS;
+                i += 1;
+                let libdirs = lib_search_paths.clone().unwrap_or_else(Jv::null);
+                ret = jq_testsuite(
+                    libdirs,
+                    (options & DUMP_DISASM) != 0 || (jq_flags & JQ_DEBUG_TRACE) != 0,
+                    (argc as usize - i) as i32,
+                    args[i..].to_vec(),
+                );
+                jq_exit_for_options(ret, options);
             }
             if arg.len() != short_opts + 1 {
                 eprintln!("{}: Unknown option {}", get_progname(), arg);
@@ -665,21 +838,20 @@ pub fn main() {
     if (options & NO_COLOR_OUTPUT) != 0 {
         dumpopts &= !JV_PRINT_COLOR;
     }
+    if let Ok(colors) = env::var("JQ_COLORS") {
+        if jq_set_colors(Some(&colors)) == 0 {
+            eprintln!("Failed to set $JQ_COLORS");
+        }
+    }
     let lib_paths = lib_search_paths
         .unwrap_or_else(|| {
             Jv::array()
                 .array_append(Jv::string("~/.jq"))
                 .array_append(Jv::string("$ORIGIN/../lib/jq"))
                 .array_append(Jv::string("$ORIGIN/../lib"))
-        });
+    });
     jq_set_attr(jq, Jv::string("JQ_LIBRARY_PATH"), lib_paths);
-    if let Some(origin) = Path::new(&args[0]).parent() {
-        jq_set_attr(
-            jq,
-            Jv::string("JQ_ORIGIN"),
-            Jv::string(origin.to_string_lossy().as_ref()),
-        );
-    }
+    jq_set_attr(jq, Jv::string("JQ_ORIGIN"), dirname_jv(&args[0]));
     if !JQ_VERSION.contains('-') {
         jq_set_attr(jq, Jv::string("VERSION_DIR"), Jv::string(JQ_VERSION));
     } else {
@@ -705,30 +877,26 @@ pub fn main() {
         .object_set(Jv::string("named"), program_arguments.clone());
     program_arguments = program_arguments
         .object_set(Jv::string("ARGS"), args_obj.clone());
-    if jv_object_has(program_arguments.clone(), Jv::string("JQ_BUILD_CONFIGURATION")) == 0 {
+    if !object_has_key(&program_arguments, "JQ_BUILD_CONFIGURATION") {
         program_arguments = program_arguments
-            .object_set(Jv::string("JQ_BUILD_CONFIGURATION"), Jv::string(""));
+            .object_set(Jv::string("JQ_BUILD_CONFIGURATION"), Jv::string(JQ_CONFIG));
     }
     if (options & FROM_FILE) != 0 {
-        match std::fs::read_to_string(&program) {
-            Ok(data) => {
-                if let Some(origin) = Path::new(&program).parent() {
-                    jq_set_attr(
-                        jq,
-                        Jv::string("PROGRAM_ORIGIN"),
-                        Jv::string(origin.to_string_lossy().as_ref()),
-                    );
-                }
-                compiled = jq_compile_args(jq, &data, program_arguments.clone());
-            }
-            Err(e) => {
-                eprintln!("{}: {}", get_progname(), e);
-                ret = JQ_ERROR_SYSTEM;
-                std_process::exit(ret.max(0));
-            }
+        let data = jv_load_file(&program, true);
+        if !jv_is_valid(&data) {
+            let msg = jv_invalid_get_msg(data);
+            eprintln!("{}: {}", get_progname(), jv_string_value(&msg));
+            ret = JQ_ERROR_SYSTEM;
+            jq_exit_for_options(ret, options);
         }
+        jq_set_attr(
+            jq,
+            Jv::string("PROGRAM_ORIGIN"),
+            jq_realpath(dirname_jv(&program)),
+        );
+        compiled = jq_compile_args(jq, jv_string_value(&data), program_arguments.clone());
     } else {
-        jq_set_attr(jq, Jv::string("PROGRAM_ORIGIN"), Jv::string("."));
+        jq_set_attr(jq, Jv::string("PROGRAM_ORIGIN"), jq_realpath(Jv::string(".")));
         if debug_compile { eprintln!("DEBUG main: calling jq_compile_args with program={:?}", program); }
         compiled = jq_compile_args(jq, &program, program_arguments.clone());
         if debug_compile { eprintln!("DEBUG main: jq_compile_args returned {}", compiled); }
@@ -736,7 +904,7 @@ pub fn main() {
     if !compiled {
         if debug_compile { eprintln!("DEBUG main: compilation failed, exiting with code 3"); }
         ret = JQ_ERROR_COMPILE;
-        std_process::exit(ret.max(0));
+        jq_exit_for_options(ret, options);
     }
     if (options & DUMP_DISASM) != 0 {
         jq_dump_disassembly(jq, 0);
@@ -745,43 +913,77 @@ pub fn main() {
     if (options & SEQ) != 0 {
         parser_flags |= JV_PARSE_SEQ;
     }
-    jq_set_debug_cb(jq, Some(debug_cb), Some(Box::new(dumpopts)));
-    jq_set_stderr_cb(jq, stderr_cb, Box::new(dumpopts));
-    // C: if (nfiles == 0) jq_util_input_add_input(input_state, "-");
-    if nfiles == 0 {
-        jq_util_input_add_input(&mut input_state, "-");
-    }
-
     // C: if ((options & RAW_INPUT))
     //     jq_util_input_set_parser(input_state, NULL, (options & SLURP) ? 1 : 0);
     // else
     //     jq_util_input_set_parser(input_state, jv_parser_new(parser_flags), (options & SLURP) ? 1 : 0);
-    if (options & RAW_INPUT) != 0 {
-        jq_util_input_set_parser(&mut input_state, None, (options & SLURP) != 0);
-    } else {
-        jq_util_input_set_parser(&mut input_state, Some(jv_parser_new(parser_flags)), (options & SLURP) != 0);
+    {
+        let mut state = input_state.borrow_mut();
+        if (options & RAW_INPUT) != 0 {
+            jq_util_input_set_parser(state.as_mut(), None, (options & SLURP) != 0);
+        } else {
+            jq_util_input_set_parser(
+                state.as_mut(),
+                Some(jv_parser_new(parser_flags)),
+                (options & SLURP) != 0,
+            );
+        }
+    }
+    let callback_data = CliCallbackData {
+        dumpopts,
+        input_state: Some(Rc::clone(&input_state)),
+    };
+    jq_set_input_cb(jq, Some(input_cb), Some(Box::new(callback_data.clone())));
+    jq_set_debug_cb(jq, Some(debug_cb), Some(Box::new(callback_data.clone())));
+    jq_set_stderr_cb(jq, stderr_cb, Box::new(callback_data));
+    // C: if (nfiles == 0) jq_util_input_add_input(input_state, "-");
+    if nfiles == 0 {
+        let mut state = input_state.borrow_mut();
+        jq_util_input_add_input(state.as_mut(), "-");
     }
 
+    let mut stdout = OutputTracker::new(io::stdout());
     if (options & PROVIDE_NULL) != 0 {
-        ret = process(jq, Jv::null(), jq_flags, dumpopts, options);
+        sync_jq_input_position(jq, &input_state);
+        ret = process(
+            jq,
+            Jv::null(),
+            jq_flags,
+            dumpopts,
+            options,
+            &mut stdout,
+            Some(&input_state),
+        );
     } else {
         // C: while (jq_util_input_errors(input_state) == 0 &&
         //          (jv_is_valid((value = jq_util_input_next_input(input_state))) || jv_invalid_has_msg(jv_copy(value))))
         loop {
-            if jq_util_input_errors(&input_state) != 0 {
+            if {
+                let state = input_state.borrow();
+                jq_util_input_errors(state.as_ref()) != 0
+            } {
                 break;
             }
-            let value = jq_util_input_next_input(&mut input_state);
-            let has_msg = {
-                let copy = value.clone();
-                copy.kind_flags & 0x10 != 0  // jv_invalid_has_msg check
+            let value = {
+                let mut state = input_state.borrow_mut();
+                jq_util_input_next_input(state.as_mut())
             };
+            sync_jq_input_position(jq, &input_state);
+            let has_msg = invalid_has_msg(&value);
             if !jv_is_valid(&value) && !has_msg {
                 break;
             }
 
             if jv_is_valid(&value) {
-                ret = process(jq, value, jq_flags, dumpopts, options);
+                ret = process(
+                    jq,
+                    value,
+                    jq_flags,
+                    dumpopts,
+                    options,
+                    &mut stdout,
+                    Some(&input_state),
+                );
                 if ret <= 0 && ret != JQ_OK_NO_OUTPUT {
                     last_result = if ret != JQ_OK_NULL_KIND { 1 } else { 0 };
                 }
@@ -791,7 +993,7 @@ pub fn main() {
             } else if (options & SEQ) == 0 {
                 // Parse error
                 ret = JQ_ERROR_UNKNOWN;
-                let msg = jv_invalid_get_msg(value.clone());
+                let msg = jv_invalid_get_msg(value);
                 if jv_is_valid(&msg) {
                     if msg.get_kind() == JvKind::String {
                         let s = jv_string_value(&msg);
@@ -803,23 +1005,48 @@ pub fn main() {
                     }
                 }
                 break;
+            } else {
+                let msg = jv_invalid_get_msg(value);
+                if jv_is_valid(&msg) {
+                    if msg.get_kind() == JvKind::String {
+                        eprintln!("jq: ignoring parse error: {}", jv_string_value(&msg));
+                    } else {
+                        let msg_str = jv_dump_string(msg.clone(), 0);
+                        eprintln!("jq: ignoring parse error: {}", jv_string_value(&msg_str));
+                    }
+                }
             }
         }
+    }
+    if {
+        let state = input_state.borrow();
+        jq_util_input_errors(state.as_ref()) != 0
+    } {
+        ret = JQ_ERROR_SYSTEM;
+    }
+    let _ = stdout.flush();
+    if let Some(e) = stdout.take_error() {
+        eprintln!("jq: error: writing output failed: {}", e);
+        ret = JQ_ERROR_SYSTEM;
     }
     // The jq reference goes out of scope naturally, then we can teardown
     let _ = jq;
     jq_teardown(&mut jq_opt);
+    if let Ok(cell) = Rc::try_unwrap(input_state) {
+        let mut state = Some(cell.into_inner());
+        jq_util_input_free(&mut state);
+    }
     if (options & EXIT_STATUS) != 0 {
         if ret != JQ_OK_NO_OUTPUT {
-            std_process::exit(ret.abs());
+            jq_exit_with_status(ret);
         } else {
             match last_result {
-                -1 => std_process::exit(JQ_OK_NO_OUTPUT.abs()),
-                0 => std_process::exit(JQ_OK_NULL_KIND.abs()),
-                _ => std_process::exit(JQ_OK.abs()),
+                -1 => jq_exit_with_status(JQ_OK_NO_OUTPUT),
+                0 => jq_exit_with_status(JQ_OK_NULL_KIND),
+                _ => jq_exit_with_status(JQ_OK),
             }
         }
     } else {
-        std_process::exit(if ret > 0 { ret } else { 0 });
+        jq_exit(ret);
     }
 }

@@ -48,17 +48,14 @@ pub fn get_home() -> Jv {
         Err(_) => Jv::invalid_with_msg(Jv::string("Could not find home directory.")),
     }
 }
-/// Get current position (filename and line)
-/// NOTE: This function needs access to JqUtilInputState but only has JqState.
-/// The input state is typically stored in the callback data, which this implementation
-/// cannot access safely without changes to the type system.
-pub fn jq_util_input_get_position<T>(_jq: &mut JqState<T>) -> Jv {
-    // TODO: To properly implement this, we need to either:
-    // 1. Add input_state field to JqState<T>, or
-    // 2. Cast input_cb_data to JqUtilInputState (unsafe), or
-    // 3. Pass the input state explicitly as a parameter
-    // For now, return invalid since we can't access the input state.
-    Jv::invalid()
+/// Get current position (filename and line).
+pub fn jq_util_input_get_position<T>(jq: &mut JqState<T>) -> Jv {
+    if jv_get_kind(&jq.input_filename) == JvKind::String {
+        let filename = crate::jv::jv_string_value(&jq.input_filename);
+        Jv::string(&format!("{}:{}", filename, jq.input_line))
+    } else {
+        Jv::invalid()
+    }
 }
 /// Get the next file from the input state
 fn next_file(state: &mut JqUtilInputState) -> Option<&str> {
@@ -256,14 +253,18 @@ pub fn jq_util_input_init(
 /// Get the current filename from the input state
 pub fn jq_util_input_get_current_filename(state: &JqUtilInputState) -> Jv {
     if jv_get_kind(&state.current_filename) == JvKind::String {
-        Jv::string("")
+        state.current_filename.clone()
     } else {
         Jv::invalid()
     }
 }
 /// Get the current line number
 pub fn jq_util_input_get_current_line<T>(jq: &mut JqState<T>) -> Jv {
-    jv_invalid_with_msg(jv_string("Unknown input line number"))
+    if jv_get_kind(&jq.input_filename) == JvKind::String {
+        Jv::number(jq.input_line as f64)
+    } else {
+        Jv::null()
+    }
 }
 /// Check if the input state is in slurp mode
 pub fn jq_util_input_is_slurping(state: &JqUtilInputState) -> bool {
@@ -274,22 +275,10 @@ pub fn jq_util_input_get_slurped(state: &mut JqUtilInputState) -> Jv {
     std::mem::replace(&mut state.slurped, Jv::invalid())
 }
 fn jv_string(s: &str) -> Jv {
-    Jv {
-        kind_flags: JvKind::String as u8,
-        pad_: 0,
-        offset: 0,
-        size: s.len() as i32,
-        u: 0,
-    }
+    crate::jv::jv_string(s)
 }
 fn jv_string_sized(_buf: &[u8], _len: usize) -> Jv {
-    Jv {
-        kind_flags: JvKind::String as u8,
-        pad_: 0,
-        offset: 0,
-        size: _len as i32,
-        u: 0,
-    }
+    crate::jv::jv_string_append_buf(Jv::string(""), _buf, _len as i32)
 }
 fn jv_string_concat(a: Jv, b: Jv) -> Jv {
     crate::jv::jv_string_concat(a, b)
@@ -301,28 +290,17 @@ fn jv_string_fmt(_fmt: &str, _args: &[&str]) -> Jv {
     jv_string("")
 }
 fn jv_number(n: usize) -> Jv {
-    Jv {
-        kind_flags: JvKind::Number as u8,
-        pad_: 0,
-        offset: 0,
-        size: 0,
-        u: n as u64,
-    }
+    Jv::number(n as f64)
 }
 fn jv_invalid_with_msg(msg: Jv) -> Jv {
-    Jv {
-        kind_flags: JvKind::Invalid as u8 | 0x10,
-        pad_: 0,
-        offset: 0,
-        size: msg.size,
-        u: msg.u,
-    }
+    crate::jv::jv_invalid_with_msg(msg)
 }
 fn jv_invalid_has_msg(jv: Jv) -> bool {
-    (jv.kind_flags & 0x10) != 0
+    jv.get_kind() == JvKind::Invalid
+        && (jv.kind_flags & crate::jv::JVP_PAYLOAD_ALLOCATED) != 0
 }
-fn jv_invalid_get_msg(_jv: Jv) -> Jv {
-    jv_string("")
+fn jv_invalid_get_msg(jv: Jv) -> Jv {
+    crate::jv::jv_invalid_get_msg(jv)
 }
 fn jv_copy(jv: &Jv) -> Jv {
     jv.clone()
