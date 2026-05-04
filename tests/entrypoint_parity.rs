@@ -122,6 +122,15 @@ fn parity_entrypoint_smoke() {
     std::fs::write(&seq_file, "\u{1e}{\"a\":1}\nnot-json\n\u{1e}{\"b\":2}\n")
         .expect("write seq fixture");
     let seq_path = seq_file.to_string_lossy().into_owned();
+    let long_line_file = tempdir.path().join("long-line.json");
+    let long_segment =
+        r#"printchar ('\\\"', printcharfun); tem = ((struct Lisp_Vector *) ((obj).u.val))->contents[i];\n"#;
+    let long_json = format!(
+        "{{\"source_code\":\"{}\"}}\n",
+        long_segment.repeat(80)
+    );
+    std::fs::write(&long_line_file, long_json).expect("write long line json fixture");
+    let long_line_path = long_line_file.to_string_lossy().into_owned();
 
     let cases: Vec<(&str, Vec<String>, Option<Vec<u8>>)> = vec![
         ("help", vec!["--help".into()], None),
@@ -265,6 +274,26 @@ fn parity_entrypoint_smoke() {
             Some(b"{\"a\":1}\n".to_vec()),
         ),
         (
+            "object keys",
+            vec!["keys".into()],
+            Some(b"{\"b\":2,\"a\":1}\n".to_vec()),
+        ),
+        (
+            "array keys",
+            vec!["keys".into()],
+            Some(b"[\"a\",\"b\"]\n".to_vec()),
+        ),
+        (
+            "decimal input",
+            vec![".".into()],
+            Some(b"{\"n\":0.0}\n".to_vec()),
+        ),
+        (
+            "exponent input",
+            vec![".m == 0.001".into()],
+            Some(b"{\"m\":1e-3}\n".to_vec()),
+        ),
+        (
             "single file input",
             vec![".a".into(), json_path.clone()],
             None,
@@ -282,6 +311,11 @@ fn parity_entrypoint_smoke() {
         (
             "seq parse error recovery",
             vec!["--seq".into(), ".".into(), seq_path],
+            None,
+        ),
+        (
+            "long string across input buffer",
+            vec![".source_code | length".into(), long_line_path],
             None,
         ),
         (

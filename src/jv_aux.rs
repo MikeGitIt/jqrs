@@ -989,7 +989,7 @@ fn jv_array() -> Jv {
     Jv::array()
 }
 fn jv_array_sized(n: i32) -> Jv {
-    Jv::array_sized(n)
+    crate::jv::jv_array_sized(n)
 }
 fn jv_array_length(v: Jv) -> i32 {
     crate::jv::jv_array_length(&v)

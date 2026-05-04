@@ -792,8 +792,8 @@ pub fn scan(p: &mut ExtendedJvParser, ch: u8, out: &mut Jv) -> Option<&'static s
         if cls == Chclass::Whitespace {
             p.base.last_ch_was_ws = true;
         }
-        // Check if not a literal character (digit, letter, minus)
-        let is_literal = matches!(cls, Chclass::Digit | Chclass::Minus | Chclass::Letter);
+        let is_literal = matches!(cls, Chclass::Digit | Chclass::Minus | Chclass::Letter)
+            || (p.base.tokenpos > 0 && (ch == b'.' || ch == b'+'));
         if !is_literal {
             if let msg @ Some(_) = check_literal(p) {
                 return msg;
@@ -812,7 +812,10 @@ pub fn scan(p: &mut ExtendedJvParser, ch: u8, out: &mut Jv) -> Option<&'static s
                                          Chclass::ArrayOpen | Chclass::ArrayClose |
                                          Chclass::Colon | Chclass::Comma);
         match cls {
-            Chclass::Digit | Chclass::Minus | Chclass::Letter => {
+            Chclass::Digit | Chclass::Minus | Chclass::Letter if is_literal => {
+                tokenadd(p, ch);
+            }
+            _ if is_literal => {
                 tokenadd(p, ch);
             }
             Chclass::Whitespace => {}
@@ -1193,6 +1196,9 @@ pub fn jv_parser_next(p: &mut ExtendedJvParser) -> Jv {
             continue;
         }
         msg = scan(p, ch, &mut value);
+        if msg.is_none() && value.is_valid() {
+            break;
+        }
     }
     if debug {
         eprintln!("DEBUG jv_parser_next: after loop, msg={:?}, value.is_valid={}, value.kind={:?}",
@@ -1484,13 +1490,7 @@ trait JvExt {
 impl JvExt for Jv {
     /// Create a number from a literal string representation
     fn number_with_literal(s: &str) -> Jv {
-        let debug = std::env::var("DEBUG_PARSER").is_ok();
-        if let Ok(n) = s.parse::<f64>() {
-            if debug { eprintln!("DEBUG number_with_literal: s={:?} -> n={} bits={:#x}", s, n, n.to_bits()); }
-            Jv::number(n)
-        } else {
-            Jv::invalid()
-        }
+        crate::jv::jv_number_with_literal(s)
     }
 
     /// Set array element at index (returns new array)

@@ -135,25 +135,36 @@ fn jq_util_input_read_more(state: &mut JqUtilInputState) -> bool {
     state.buf.fill(0);
     state.buf_valid_len = 0;
     if let Some(ref mut input) = state.current_input {
-        let mut line = String::new();
-        match input.read_line(&mut line) {
-            Ok(0) => {
-                // EOF reached - close file (C: fclose + state->current_input = NULL)
-                state.buf[0] = 0;
-                // Drop will happen when we set to None
-            }
-            Ok(_n) => {
-                let bytes = line.as_bytes();
-                let copy_len = bytes.len().min(state.buf.len() - 1);
-                state.buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                state.buf_valid_len = copy_len;
-                if line.contains('\n') {
-                    state.current_line += 1;
+        if state.parser.is_some() {
+            match input.read(&mut state.buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    state.buf_valid_len = n;
+                    state.current_line += state.buf[..n].iter().filter(|&&b| b == b'\n').count();
+                }
+                Err(_) => {
+                    state.failures += 1;
                 }
             }
-            Err(_) => {
-                state.buf[0] = 0;
-                state.failures += 1;
+        } else {
+            let mut line = String::new();
+            match input.read_line(&mut line) {
+                Ok(0) => {
+                    state.buf[0] = 0;
+                }
+                Ok(_n) => {
+                    let bytes = line.as_bytes();
+                    let copy_len = bytes.len().min(state.buf.len() - 1);
+                    state.buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                    state.buf_valid_len = copy_len;
+                    if line.contains('\n') {
+                        state.current_line += 1;
+                    }
+                }
+                Err(_) => {
+                    state.buf[0] = 0;
+                    state.failures += 1;
+                }
             }
         }
         // Close file on EOF (read returned 0 bytes)
@@ -396,9 +407,17 @@ pub fn jq_util_input_next_input(state: &mut JqUtilInputState) -> Jv {
             }
 
             // Get next value from parser using real jv_parser_next
-            if let Some(parser) = get_parser_mut(state) {
-                value = jv_parser_next(parser);
-                has_more = jv_parser_remaining(parser) > 0;
+            if let Some((parsed_value, parser_has_more, parser_line)) = {
+                get_parser_mut(state).map(|parser| {
+                    let parsed_value = jv_parser_next(parser);
+                    let parser_has_more = jv_parser_remaining(parser) > 0;
+                    let parser_line = parser.base.line;
+                    (parsed_value, parser_has_more, parser_line)
+                })
+            } {
+                value = parsed_value;
+                has_more = parser_has_more;
+                state.current_line = parser_line as usize;
             } else {
                 value = Jv::invalid();
                 has_more = false;
