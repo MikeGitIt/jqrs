@@ -20,7 +20,10 @@ use jq_with_autobuild::jv::{
     jv_object_iter, jv_object_iter_key, jv_object_iter_next, jv_object_iter_valid,
 };
 use jq_with_autobuild::jv_file::jv_load_file;
-use jq_with_autobuild::jv_print::{jv_dumpf, jv_dump_string, jq_set_colors};
+use jq_with_autobuild::jv_print::{
+    jv_dumpf, jv_dump_string, jq_set_colors, JV_PRINT_ASCII, JV_PRINT_COLOR,
+    JV_PRINT_ISATTY, JV_PRINT_PRETTY, JV_PRINT_SORTED, JV_PRINT_TAB,
+};
 use jq_with_autobuild::jv_parse::jv_parse;
 use jq_with_autobuild::execute::{
     jq_init, jq_start, jq_next, jq_halted, jq_get_exit_code, jq_get_error_message,
@@ -59,12 +62,6 @@ pub const RUN_TESTS: i32 = 32768;
 pub const DUMP_DISASM: i32 = 65536;
 pub const JQ_DEBUG_TRACE: i32 = 1;
 pub const JQ_DEBUG_TRACE_ALL: i32 = 2;
-pub const JV_PRINT_PRETTY: i32 = 1;
-pub const JV_PRINT_TAB: i32 = 2;
-pub const JV_PRINT_COLOR: i32 = 4;
-pub const JV_PRINT_SORTED: i32 = 8;
-pub const JV_PRINT_ASCII: i32 = 16;
-pub const JV_PRINT_ISATTY: i32 = 32;
 pub const JV_PARSE_STREAMING: i32 = 1;
 pub const JV_PARSE_STREAM_ERRORS: i32 = 2;
 pub const JV_PARSE_SEQ: i32 = 4;

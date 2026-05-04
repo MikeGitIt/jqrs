@@ -203,6 +203,26 @@ fn parity_entrypoint_smoke() {
             None,
         ),
         (
+            "ascii output",
+            vec!["-a".into(), "-n".into(), "\"\u{00b5}\"".into()],
+            None,
+        ),
+        (
+            "raw ascii output",
+            vec![
+                "-r".into(),
+                "-a".into(),
+                "-n".into(),
+                "\"\u{00b5}\"".into(),
+            ],
+            None,
+        ),
+        (
+            "tab indentation",
+            vec!["--tab".into(), ".".into()],
+            Some(b"{\"a\":[1]}\n".to_vec()),
+        ),
+        (
             "rawfile argument",
             vec![
                 "--rawfile".into(),
