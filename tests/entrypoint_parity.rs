@@ -131,6 +131,16 @@ fn parity_entrypoint_smoke() {
     );
     std::fs::write(&long_line_file, long_json).expect("write long line json fixture");
     let long_line_path = long_line_file.to_string_lossy().into_owned();
+    let same_line_values_file = tempdir.path().join("same-line-values.json");
+    std::fs::write(&same_line_values_file, "1 2\n").expect("write same-line values fixture");
+    let same_line_values_path = same_line_values_file.to_string_lossy().into_owned();
+    let number_no_newline_file = tempdir.path().join("number-no-newline.json");
+    std::fs::write(&number_no_newline_file, "1").expect("write number without newline fixture");
+    let number_no_newline_path = number_no_newline_file.to_string_lossy().into_owned();
+    let object_no_newline_file = tempdir.path().join("object-no-newline.json");
+    std::fs::write(&object_no_newline_file, "{\n\"a\":1\n}")
+        .expect("write object without newline fixture");
+    let object_no_newline_path = object_no_newline_file.to_string_lossy().into_owned();
 
     let cases: Vec<(&str, Vec<String>, Option<Vec<u8>>)> = vec![
         ("help", vec!["--help".into()], None),
@@ -269,6 +279,16 @@ fn parity_entrypoint_smoke() {
             None,
         ),
         (
+            "input line number same-line values",
+            vec!["input_line_number".into(), same_line_values_path],
+            None,
+        ),
+        (
+            "input line number no trailing newline number",
+            vec!["input_line_number".into(), number_no_newline_path],
+            None,
+        ),
+        (
             "stdin input",
             vec![".a".into()],
             Some(b"{\"a\":1}\n".to_vec()),
@@ -282,6 +302,21 @@ fn parity_entrypoint_smoke() {
             "array keys",
             vec!["keys".into()],
             Some(b"[\"a\",\"b\"]\n".to_vec()),
+        ),
+        (
+            "object indexed by number error",
+            vec![".[0]".into()],
+            Some(b"{\"a\":1}\n".to_vec()),
+        ),
+        (
+            "object indexed by number without trailing newline",
+            vec![".[0]".into(), object_no_newline_path],
+            None,
+        ),
+        (
+            "array indexed by string error",
+            vec![".call_graph".into()],
+            Some(b"[]\n".to_vec()),
         ),
         (
             "decimal input",

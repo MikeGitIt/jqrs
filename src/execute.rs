@@ -2956,40 +2956,7 @@ fn jv_object_merge(a: Jv, b: Jv) -> Jv {
 
 /// Get a value by key/index - implements jv_get from C
 fn jv_get(container: Jv, key: Jv) -> Jv {
-    match jv_get_kind(&container) {
-        JvKind::Object => {
-            if jv_get_kind(&key) == JvKind::String {
-                let result = jv_object_get(&container, key);
-                jv_free(container);
-                result
-            } else {
-                jv_free(container);
-                jv_free(key);
-                jv_invalid()
-            }
-        }
-        JvKind::Array => {
-            if jv_get_kind(&key) == JvKind::Number {
-                let idx = jv_number_value(&key) as i32;
-                jv_free(key);
-                let result = jv_array_get(container, idx);
-                if jv_get_kind(&result) == JvKind::Invalid {
-                    jv_invalid()
-                } else {
-                    result
-                }
-            } else {
-                jv_free(container);
-                jv_free(key);
-                jv_invalid()
-            }
-        }
-        _ => {
-            jv_free(container);
-            jv_free(key);
-            jv_invalid()
-        }
-    }
+    crate::jv_aux::jv_get(container, key)
 }
 
 

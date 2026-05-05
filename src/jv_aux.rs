@@ -197,12 +197,14 @@ pub fn jv_get(t: Jv, k: Jv) -> Jv {
         let t_kind = jv_get_kind(&t);
         let k_kind = jv_get_kind(&k);
         let v = if k_kind == JvKind::String && jv_string_length_bytes(jv_copy(&k)) < 30 {
-            jv_invalid_with_msg(
-                jv_string_fmt(
-                    &format!("Cannot index {} with string", jv_kind_name(t_kind)),
-                    jv_string_value(&k),
-                ),
-            )
+            let dumped_key = crate::jv_print::jv_dump_string(jv_copy(&k), 0);
+            let key = jv_string_value(&dumped_key).to_string();
+            jv_free(dumped_key);
+            jv_invalid_with_msg(jv_string(&format!(
+                "Cannot index {} with string {}",
+                jv_kind_name(t_kind),
+                key
+            )))
         } else {
             jv_invalid_with_msg(
                 jv_string_fmt(

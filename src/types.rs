@@ -759,6 +759,7 @@ pub struct JqUtilInputState {
     /// At runtime this holds Box<ExtendedJvParser> from jv_parse module.
     pub parser: Option<Box<dyn std::any::Any>>,
     pub current_input: Option<BufReader<Box<dyn Read>>>,
+    pub current_input_finished: bool,
     pub files: Vec<String>,
     pub nfiles: i32,
     pub curr_file: i32,
@@ -777,6 +778,7 @@ impl std::fmt::Debug for JqUtilInputState {
             .field("err_cb_data", &self.err_cb_data.as_ref().map(|_| "<any>"))
             .field("parser", &self.parser)
             .field("current_input", &self.current_input.as_ref().map(|_| "<dyn Read>"))
+            .field("current_input_finished", &self.current_input_finished)
             .field("files", &self.files)
             .field("nfiles", &self.nfiles)
             .field("curr_file", &self.curr_file)

@@ -98,8 +98,12 @@ pub fn jq_util_input_set_parser(
 }
 /// Read more input from the current file
 fn jq_util_input_read_more(state: &mut JqUtilInputState) -> bool {
-    let need_new_file = state.current_input.is_none();
+    let need_new_file = state.current_input.is_none() || state.current_input_finished;
     if need_new_file {
+        if state.current_input.is_some() {
+            state.current_input = None;
+        }
+        state.current_input_finished = false;
         jv_free(std::mem::replace(&mut state.current_filename, Jv::invalid()));
         state.current_line = 0;
         let next = if state.curr_file < state.nfiles {
@@ -118,6 +122,7 @@ fn jq_util_input_read_more(state: &mut JqUtilInputState) -> bool {
                     Ok(file) => {
                         state.current_input = Some(BufReader::new(Box::new(file)));
                         state.current_filename = Jv::string(&f);
+                        state.current_input_finished = false;
                     }
                     Err(_) => {
                         if let Some(ref cb) = state.err_cb {
@@ -135,47 +140,57 @@ fn jq_util_input_read_more(state: &mut JqUtilInputState) -> bool {
     state.buf.fill(0);
     state.buf_valid_len = 0;
     if let Some(ref mut input) = state.current_input {
-        if state.parser.is_some() {
-            match input.read(&mut state.buf) {
-                Ok(0) => {}
-                Ok(n) => {
-                    state.buf_valid_len = n;
-                    state.current_line += state.buf[..n].iter().filter(|&&b| b == b'\n').count();
-                }
+        let limit = state.buf.len().saturating_sub(1);
+        let mut total = 0usize;
+        let mut saw_newline = false;
+        while total < limit {
+            let available = match input.fill_buf() {
+                Ok(bytes) => bytes,
                 Err(_) => {
                     state.failures += 1;
+                    state.current_input_finished = true;
+                    break;
                 }
+            };
+            if available.is_empty() {
+                state.current_input_finished = true;
+                break;
             }
-        } else {
-            let mut line = String::new();
-            match input.read_line(&mut line) {
-                Ok(0) => {
-                    state.buf[0] = 0;
+            let remaining = limit - total;
+            let scan_len = available.len().min(remaining);
+            let take = match available[..scan_len].iter().position(|&b| b'\n' == b) {
+                Some(pos) => {
+                    saw_newline = true;
+                    pos + 1
                 }
-                Ok(_n) => {
-                    let bytes = line.as_bytes();
-                    let copy_len = bytes.len().min(state.buf.len() - 1);
-                    state.buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                    state.buf_valid_len = copy_len;
-                    if line.contains('\n') {
-                        state.current_line += 1;
-                    }
-                }
-                Err(_) => {
-                    state.buf[0] = 0;
-                    state.failures += 1;
-                }
+                None => scan_len,
+            };
+            state.buf[total..total + take].copy_from_slice(&available[..take]);
+            input.consume(take);
+            total += take;
+            if saw_newline {
+                state.current_line += 1;
+                break;
+            }
+            if take == remaining {
+                break;
             }
         }
-        // Close file on EOF (read returned 0 bytes)
+        if !saw_newline && state.parser.is_some() {
+            state.buf_valid_len = state.buf[..total]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(total);
+        } else {
+            state.buf_valid_len = total;
+        }
         if state.buf_valid_len == 0 {
-            state.current_input = None;
-            jv_free(std::mem::replace(&mut state.current_filename, Jv::invalid()));
-            state.current_line = 0;
+            state.buf[0] = 0;
         }
     }
     // Return true if this is the last input (no more files and no current file)
-    state.curr_file >= state.nfiles && state.current_input.is_none()
+    state.curr_file >= state.nfiles
+        && (state.current_input.is_none() || state.current_input_finished)
 }
 /// Get the real path of a file
 pub fn jq_realpath(path: Jv) -> Jv {
@@ -407,17 +422,15 @@ pub fn jq_util_input_next_input(state: &mut JqUtilInputState) -> Jv {
             }
 
             // Get next value from parser using real jv_parser_next
-            if let Some((parsed_value, parser_has_more, parser_line)) = {
+            if let Some((parsed_value, parser_has_more)) = {
                 get_parser_mut(state).map(|parser| {
                     let parsed_value = jv_parser_next(parser);
                     let parser_has_more = jv_parser_remaining(parser) > 0;
-                    let parser_line = parser.base.line;
-                    (parsed_value, parser_has_more, parser_line)
+                    (parsed_value, parser_has_more)
                 })
             } {
                 value = parsed_value;
                 has_more = parser_has_more;
-                state.current_line = parser_line as usize;
             } else {
                 value = Jv::invalid();
                 has_more = false;
@@ -470,6 +483,7 @@ impl Default for JqUtilInputState {
             err_cb_data: None,
             parser: None,
             current_input: None,
+            current_input_finished: false,
             files: Vec::new(),
             nfiles: 0,
             curr_file: 0,
