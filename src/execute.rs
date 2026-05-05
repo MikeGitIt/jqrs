@@ -2361,6 +2361,26 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
                 crate::builtin::type_error(input, "has no keys")
             }
         }
+        "to_entries" => {
+            if input.get_kind() == JvKind::Object || input.get_kind() == JvKind::Array {
+                let keys = jv_keys_unsorted(jv_copy(&input));
+                let len = crate::jv::jv_array_length(&keys);
+                let mut result = crate::jv::jv_array_sized(len);
+                for i in 0..len {
+                    let key = crate::jv::jv_array_get(jv_copy(&keys), i);
+                    let value = jv_get(jv_copy(&input), jv_copy(&key));
+                    let mut entry = crate::jv::jv_object();
+                    entry = crate::jv::jv_object_set(entry, Jv::string("key"), key);
+                    entry = crate::jv::jv_object_set(entry, Jv::string("value"), value);
+                    result = crate::jv::jv_array_append(result, entry);
+                }
+                jv_free(keys);
+                jv_free(input);
+                result
+            } else {
+                crate::builtin::type_error(input, "has no keys")
+            }
+        }
         "length" => {
             match input.get_kind() {
                 JvKind::Array => {
@@ -2751,7 +2771,7 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             // Return list of builtin names
             let mut arr = crate::jv::jv_array();
             for name in ["keys", "keys_unsorted", "length", "type", "has", "contains",
-                         "sort", "reverse", "add", "floor", "ceil", "round", "sqrt",
+                         "to_entries", "sort", "reverse", "add", "floor", "ceil", "round", "sqrt",
                          "tonumber", "tostring", "tojson", "fromjson", "not", "null",
                          "true", "false", "empty", "error", "first", "last", "min", "max",
                          "unique", "flatten", "getpath", "setpath", "delpaths",

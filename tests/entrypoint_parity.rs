@@ -304,6 +304,16 @@ fn parity_entrypoint_smoke() {
             Some(b"[\"a\",\"b\"]\n".to_vec()),
         ),
         (
+            "object to_entries",
+            vec!["to_entries".into()],
+            Some(b"{\"b\":2,\"a\":1}\n".to_vec()),
+        ),
+        (
+            "array to_entries",
+            vec!["to_entries".into()],
+            Some(b"[\"a\",\"b\"]\n".to_vec()),
+        ),
+        (
             "object indexed by number error",
             vec![".[0]".into()],
             Some(b"{\"a\":1}\n".to_vec()),

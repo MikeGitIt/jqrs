@@ -2322,6 +2322,7 @@ pub fn builtins_bind<T>(_jq: &mut JqState<T>, bb: Block) -> Block {
         // Core functions
         Cfunction { fptr: None, name: Some("keys".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("keys_unsorted".to_string()), nargs: 1 },
+        Cfunction { fptr: None, name: Some("to_entries".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("length".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("utf8bytelength".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("type".to_string()), nargs: 1 },
