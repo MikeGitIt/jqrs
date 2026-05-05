@@ -737,6 +737,7 @@ mod tests {
             subfunctions: vec![],
             nsubfunctions: 0,
             parent: None,
+            parent_ptr: None,
             debuginfo: Jv::default(),
         };
         let size = frame_size(&bc);
@@ -869,8 +870,7 @@ pub fn _jq_path_append<T>(jq: &mut JqState<T>, v: Jv, p: Jv, value_at_path: Jv) 
     }
     if jv_get_kind(&p) == JvKind::Array {
         let path = mem::take(&mut jq.path);
-        // Use array_append for each element since array_concat doesn't exist
-        jq.path = jv_array_append(path, p);
+        jq.path = crate::jv::jv_array_concat(path, p);
     } else {
         let path = mem::take(&mut jq.path);
         jq.path = jv_array_append(path, p);
@@ -1111,7 +1111,7 @@ fn jq_compile_args_impl<T, J: JqStateAccess<T>>(jq: &mut J, program_str: &str, a
     linemap.push(program_str.len() as i32);
     let nlines = linemap.len() as i32 - 1; // nlines doesn't count the end marker
     let mut locations = Locfile::<()> {
-        fname: "<program>".to_string(),
+        fname: "<top-level>".to_string(),
         data: program_str.to_string(),
         length: program_str.len() as i32,
         linemap,
@@ -1129,8 +1129,28 @@ fn jq_compile_args_impl<T, J: JqStateAccess<T>>(jq: &mut J, program_str: &str, a
 
     if parse_errors > 0 {
         if debug { eprintln!("DEBUG: Parse failed with {} errors", parse_errors); }
-        let msg = Jv::string(&format!("jq: {} parse errors", parse_errors));
+        let msg = locations
+            .error
+            .take()
+            .unwrap_or_else(|| format!("jq: {} parse errors", parse_errors));
+        let msg = Jv::string(&msg);
         jq_report_error(jq_inner, msg);
+        jv_free(args);
+        return false;
+    }
+
+    let mut lib_state = LibLoadingState::default();
+    let jq_origin = jq_get_jq_origin(jq_inner);
+    let prog_origin = jq_get_prog_origin(jq_inner);
+    let dep_errors = crate::linker::process_dependencies(
+        jq_inner,
+        jq_origin,
+        prog_origin,
+        &mut program,
+        &mut lib_state,
+    );
+    if dep_errors > 0 {
+        if debug { eprintln!("DEBUG: Dependency processing failed with {} errors", dep_errors); }
         jv_free(args);
         return false;
     }
@@ -1155,7 +1175,11 @@ fn jq_compile_args_impl<T, J: JqStateAccess<T>>(jq: &mut J, program_str: &str, a
 
     if compile_errors > 0 {
         if debug { eprintln!("DEBUG: Compile failed with {} errors", compile_errors); }
-        let msg = Jv::string(&format!("jq: {} compile errors", compile_errors));
+        let msg = locations
+            .error
+            .take()
+            .unwrap_or_else(|| format!("jq: {} compile errors", compile_errors));
+        let msg = Jv::string(&msg);
         jq_report_error(jq_inner, msg);
         return false;
     }
@@ -1541,8 +1565,14 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                         // Check path integrity
                         if !path_intact(jq_inner, jv_copy(&t)) {
                             if debug { eprintln!("EXEC INDEX: path_intact failed"); }
+                            let key_detail = crate::jv_print::jv_dump_string_trunc(jv_copy(&k), 15);
+                            let target_detail = crate::jv_print::jv_dump_string_trunc(jv_copy(&t), 30);
+                            let msg = format!(
+                                "Invalid path expression near attempt to access element {} of {}",
+                                key_detail, target_detail
+                            );
                             set_error_jq(jq_inner, jv_invalid_with_msg(
-                                Jv::string("Invalid path expression"),
+                                Jv::string(&msg),
                             ));
                             // Backtrack
                             match stack_restore_impl(jq_inner) {
@@ -1910,7 +1940,11 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                 if let Some(container) = stack_pop(jq_inner) {
                     // Check path integrity
                     if !path_intact(jq_inner, jv_copy(&container)) {
-                        let msg = Jv::string("Invalid path expression near attempt to iterate");
+                        let detail = crate::jv_print::jv_dump_string_trunc(jv_copy(&container), 30);
+                        let msg = Jv::string(&format!(
+                            "Invalid path expression near attempt to iterate through {}",
+                            detail
+                        ));
                         set_error_jq(jq_inner, jv_invalid_with_msg(msg));
                         jv_free(container);
                         match stack_restore_impl(jq_inner) {
@@ -1979,13 +2013,12 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                 } else {
                     // Not iterable
                     if on_bt_each == on_backtrack(EACH) {
-                        let msg = format!("Cannot iterate over {}",
-                            match container_kind {
-                                JvKind::Null => "null",
-                                JvKind::Number => "number",
-                                JvKind::String => "string",
-                                _ => "value",
-                            });
+                        let detail = crate::jv_print::jv_dump_string_trunc(jv_copy(&container), 15);
+                        let msg = format!(
+                            "Cannot iterate over {} ({})",
+                            crate::jv::jv_kind_name(container_kind),
+                            detail
+                        );
                         set_error_jq(jq_inner, jv_invalid_with_msg(Jv::string(&msg)));
                     }
                     (false, false, Jv::null(), Jv::null())
@@ -2096,41 +2129,21 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                 }
             }
 
-            RANGE => {
-                // RANGE opcode: iterate from current value up to limit
-                // Read the variable binding (level and var index)
+            op if op == RANGE || op == on_backtrack(RANGE) => {
+                let level = bc.code[pc_offset] as i32;
+                pc_offset += 1;
                 let var_idx = bc.code[pc_offset] as i32;
                 pc_offset += 1;
 
-                // Get current counter value from variable using frame_local_var
                 let counter = if let Some(v) = frame_local_var(jq_inner, var_idx, 0) {
                     jv_copy(v)
                 } else {
-                    Jv::number(0.0)
+                    Jv::invalid()
                 };
 
-                let idx = jv_number_value(&counter) as i32;
-                jv_free(counter);
-
-                // Get limit from stack
                 if let Some(limit_jv) = stack_pop(jq_inner) {
-                    let limit = jv_number_value(&limit_jv) as i32;
-
-                    if idx < limit {
-                        // Save state for next iteration
-                        let spos = stack_get_pos(jq_inner);
-                        stack_save(jq_inner, Some(pc_offset - 2), spos);
-
-                        // Push limit back and push current value
-                        stack_push(jq_inner, limit_jv);
-                        stack_push(jq_inner, Jv::number(idx as f64));
-
-                        // Increment counter in frame
-                        if let Some(v) = frame_local_var(jq_inner, var_idx, 0) {
-                            let old = std::mem::replace(v, Jv::number((idx + 1) as f64));
-                            jv_free(old);
-                        }
-                    } else {
+                    if raising {
+                        jv_free(counter);
                         jv_free(limit_jv);
                         match stack_restore_impl(jq_inner) {
                             Some(offset) => {
@@ -2139,38 +2152,30 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                             }
                             None => return Jv::invalid(),
                         }
-                    }
-                }
-            }
-
-            op if op == on_backtrack(RANGE) => {
-                // Continue range iteration - same logic as RANGE
-                let var_idx = bc.code[pc_offset] as i32;
-                pc_offset += 1;
-
-                let counter = if let Some(v) = frame_local_var(jq_inner, var_idx, 0) {
-                    jv_copy(v)
-                } else {
-                    Jv::number(0.0)
-                };
-
-                let idx = jv_number_value(&counter) as i32;
-                jv_free(counter);
-
-                if let Some(limit_jv) = stack_pop(jq_inner) {
-                    let limit = jv_number_value(&limit_jv) as i32;
-
-                    if idx < limit {
-                        let spos = stack_get_pos(jq_inner);
-                        stack_save(jq_inner, Some(pc_offset - 2), spos);
-                        stack_push(jq_inner, limit_jv);
-                        stack_push(jq_inner, Jv::number(idx as f64));
-
-                        if let Some(v) = frame_local_var(jq_inner, var_idx, 0) {
-                            let old = std::mem::replace(v, Jv::number((idx + 1) as f64));
-                            jv_free(old);
+                    } else if jv_get_kind(&counter) != JvKind::Number
+                        || jv_get_kind(&limit_jv) != JvKind::Number
+                    {
+                        jv_free(counter);
+                        jv_free(limit_jv);
+                        set_error_jq(
+                            jq_inner,
+                            jv_invalid_with_msg(Jv::string("Range bounds must be numeric")),
+                        );
+                        match stack_restore_impl(jq_inner) {
+                            Some(offset) => {
+                                pc_offset = offset;
+                                backtracking = true;
+                            }
+                            None => {
+                                if !jv_is_valid(&jq_inner.error) {
+                                    let error = std::mem::replace(&mut jq_inner.error, jv_null());
+                                    return error;
+                                }
+                                return Jv::invalid();
+                            }
                         }
-                    } else {
+                    } else if jv_number_value(&counter) >= jv_number_value(&limit_jv) {
+                        jv_free(counter);
                         jv_free(limit_jv);
                         match stack_restore_impl(jq_inner) {
                             Some(offset) => {
@@ -2179,6 +2184,15 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                             }
                             None => return Jv::invalid(),
                         }
+                    } else {
+                        let next = jv_number_value(&counter) + 1.0;
+                        if let Some(v) = frame_local_var(jq_inner, var_idx, level) {
+                            jv_free(std::mem::replace(v, Jv::number(next)));
+                        }
+                        let spos = stack_get_pos(jq_inner);
+                        stack_push(jq_inner, limit_jv);
+                        stack_save(jq_inner, Some(pc_offset - 3), spos);
+                        stack_push(jq_inner, counter);
                     }
                 }
             }
@@ -2220,8 +2234,10 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                 if let Some(v) = stack_pop(jq_inner) {
                     // C: if (!path_intact(jq, jv_copy(v))) { ... error ... }
                     if !path_intact(jq_inner, jv_copy(&v)) {
+                        let detail = crate::jv_print::jv_dump_string_trunc(jv_copy(&v), 30);
+                        let msg = format!("Invalid path expression with result {}", detail);
                         set_error_jq(jq_inner, jv_invalid_with_msg(
-                            Jv::string("Invalid path expression with result"),
+                            Jv::string(&msg),
                         ));
                         jv_free(v);
                         match stack_restore_impl(jq_inner) {
@@ -2297,9 +2313,17 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             STORE_GLOBAL => {
-                let _kidx = bc.code[pc_offset];
+                let kidx = bc.code[pc_offset] as i32;
                 pc_offset += 1;
-                if let Some(val) = stack_pop(jq_inner) {
+                let val = crate::jv::jv_array_get(jv_copy(&bc.constants), kidx);
+                let level = bc.code[pc_offset] as i32;
+                pc_offset += 1;
+                let v = bc.code[pc_offset] as i32;
+                pc_offset += 1;
+                if let Some(var) = frame_local_var(jq_inner, v, level) {
+                    let old = std::mem::replace(var, val);
+                    jv_free(old);
+                } else {
                     jv_free(val);
                 }
             }
@@ -2340,11 +2364,20 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
 // ============================================================================
 
 fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
-    use crate::jv_aux::{jv_keys, jv_keys_unsorted, jv_has, jv_get, jv_set, jv_getpath, jv_setpath, jv_delpaths, jv_sort, jv_group};
-    use crate::jv::{jv_array_length, jv_string_length_bytes, jv_object_length, jv_get_kind, jv_kind_name};
+    use crate::jv_aux::{jv_keys, jv_keys_unsorted, jv_has, jv_get, jv_set, jv_setpath, jv_delpaths, jv_sort, jv_group};
+    use crate::jv::{jv_array_length, jv_object_length, jv_get_kind, jv_kind_name};
 
     // args[0] is the input (top of stack when popped)
     let input = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+    let unary_number = |input: Jv, f: fn(f64) -> f64| -> Jv {
+        if input.get_kind() == JvKind::Number {
+            let v = f(input.number_value());
+            jv_free(input);
+            Jv::number(v)
+        } else {
+            crate::builtin::type_error(input, "number required")
+        }
+    };
 
     match name {
         "keys" => {
@@ -2381,6 +2414,10 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
                 crate::builtin::type_error(input, "has no keys")
             }
         }
+        "format" => {
+            let fmt = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            crate::builtin::f_format(jq, input, fmt)
+        }
         "length" => {
             match input.get_kind() {
                 JvKind::Array => {
@@ -2394,8 +2431,7 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
                     Jv::number(len as f64)
                 }
                 JvKind::String => {
-                    let len = jv_string_length_bytes(&input);
-                    jv_free(input);
+                    let len = crate::jv::jv_string_length_codepoints(input);
                     Jv::number(len as f64)
                 }
                 JvKind::Null => {
@@ -2409,6 +2445,9 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
                 }
                 _ => crate::builtin::type_error(input, "has no length")
             }
+        }
+        "utf8bytelength" => {
+            crate::builtin::f_utf8bytelength(jq, input)
         }
         "type" => {
             let kind = input.get_kind();
@@ -2491,6 +2530,79 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
                 crate::builtin::type_error(input, "cannot sqrt non-number")
             }
         }
+        "fabs" => unary_number(input, f64::abs),
+        "sin" => unary_number(input, f64::sin),
+        "cos" => unary_number(input, f64::cos),
+        "tan" => unary_number(input, f64::tan),
+        "asin" => unary_number(input, f64::asin),
+        "acos" => unary_number(input, f64::acos),
+        "atan" => unary_number(input, f64::atan),
+        "log" => unary_number(input, f64::ln),
+        "log10" => unary_number(input, f64::log10),
+        "log2" => unary_number(input, f64::log2),
+        "exp" => unary_number(input, f64::exp),
+        "exp2" => unary_number(input, f64::exp2),
+        "exp10" => unary_number(input, |v| 10.0_f64.powf(v)),
+        "expm1" => unary_number(input, f64::exp_m1),
+        "pow" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            if a.get_kind() != JvKind::Number {
+                jv_free(b);
+                crate::builtin::type_error(a, "number required")
+            } else if b.get_kind() != JvKind::Number {
+                jv_free(a);
+                crate::builtin::type_error(b, "number required")
+            } else {
+                let ret = Jv::number(a.number_value().powf(b.number_value()));
+                jv_free(a);
+                jv_free(b);
+                ret
+            }
+        }
+        "atan2" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            if a.get_kind() != JvKind::Number {
+                jv_free(b);
+                crate::builtin::type_error(a, "number required")
+            } else if b.get_kind() != JvKind::Number {
+                jv_free(a);
+                crate::builtin::type_error(b, "number required")
+            } else {
+                let ret = Jv::number(a.number_value().atan2(b.number_value()));
+                jv_free(a);
+                jv_free(b);
+                ret
+            }
+        }
+        "fma" => {
+            let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            let c = if !args.is_empty() { args.remove(0) } else { Jv::null() };
+            jv_free(input);
+            if a.get_kind() != JvKind::Number {
+                jv_free(b);
+                jv_free(c);
+                crate::builtin::type_error(a, "number required")
+            } else if b.get_kind() != JvKind::Number {
+                jv_free(a);
+                jv_free(c);
+                crate::builtin::type_error(b, "number required")
+            } else if c.get_kind() != JvKind::Number {
+                jv_free(a);
+                jv_free(b);
+                crate::builtin::type_error(c, "number required")
+            } else {
+                let ret = Jv::number(a.number_value().mul_add(b.number_value(), c.number_value()));
+                jv_free(a);
+                jv_free(b);
+                jv_free(c);
+                ret
+            }
+        }
         "tonumber" => {
             crate::builtin::f_tonumber(jq, input)
         }
@@ -2566,6 +2678,14 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
         }
         "min" => crate::builtin::f_min(jq, input),
         "max" => crate::builtin::f_max(jq, input),
+        "_min_by_impl" => {
+            let keys = if !args.is_empty() { args.remove(0) } else { Jv::array() };
+            crate::builtin::f_min_by_impl(jq, input, keys)
+        }
+        "_max_by_impl" => {
+            let keys = if !args.is_empty() { args.remove(0) } else { Jv::array() };
+            crate::builtin::f_max_by_impl(jq, input, keys)
+        }
         "unique" => crate::builtin::f_unique(jq, input),
         "flatten" => {
             let depth = if !args.is_empty() { args.remove(0) } else { Jv::number(-1.0) };
@@ -2573,7 +2693,7 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
         }
         "getpath" => {
             let path = if !args.is_empty() { args.remove(0) } else { Jv::array() };
-            jv_getpath(input, path)
+            crate::builtin::f_getpath(jq, input, path)
         }
         "setpath" => {
             let path = if !args.is_empty() { args.remove(0) } else { Jv::array() };
@@ -2604,6 +2724,10 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             let sep = if !args.is_empty() { args.remove(0) } else { Jv::string("") };
             crate::builtin::f_string_split(jq, input, sep)
         }
+        "_strindices" => {
+            let needle = if !args.is_empty() { args.remove(0) } else { Jv::string("") };
+            crate::builtin::f_string_indexes(jq, input, needle)
+        }
         "startswith" => {
             let s = if !args.is_empty() { args.remove(0) } else { Jv::string("") };
             crate::builtin::f_startswith(jq, input, s)
@@ -2620,6 +2744,9 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             let s = if !args.is_empty() { args.remove(0) } else { Jv::string("") };
             crate::builtin::f_rtrimstr(jq, input, s)
         }
+        "trim" => crate::builtin::f_string_trim(jq, input),
+        "ltrim" => crate::builtin::f_string_ltrim(jq, input),
+        "rtrim" => crate::builtin::f_string_rtrim(jq, input),
         "ascii_downcase" => crate::builtin::f_ascii_downcase(jq, input),
         "ascii_upcase" => crate::builtin::f_ascii_upcase(jq, input),
         "explode" => crate::builtin::f_string_explode(jq, input),
@@ -2629,6 +2756,17 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             jv_free(input);
             crate::builtin::f_now(jq, Jv::null())
         }
+        "strftime" => {
+            let fmt = if !args.is_empty() { args.remove(0) } else { Jv::string("") };
+            crate::builtin::f_strftime(jq, input, fmt)
+        }
+        "strflocaltime" => {
+            let fmt = if !args.is_empty() { args.remove(0) } else { Jv::string("") };
+            crate::builtin::f_strflocaltime(jq, input, fmt)
+        }
+        "mktime" => crate::builtin::f_mktime(jq, input),
+        "gmtime" => crate::builtin::f_gmtime(jq, input),
+        "localtime" => crate::builtin::f_localtime(jq, input),
         "debug" => crate::builtin::f_debug(jq, input),
         "stderr" => crate::builtin::f_stderr(jq, input),
         "halt" => crate::builtin::f_halt(jq, input),
@@ -2640,6 +2778,8 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
         "inputs" => crate::builtin::f_input(jq, input),
         "input_filename" => crate::builtin::f_current_filename(jq, input),
         "input_line_number" => crate::builtin::f_current_line(jq, input),
+        "have_decnum" | "have_literal_numbers" => crate::builtin::f_have_decnum(jq, input),
+        "modulemeta" => crate::builtin::f_modulemeta(jq, input),
         "infinite" => {
             jv_free(input);
             Jv::number(f64::INFINITY)
@@ -2772,16 +2912,20 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             let mut arr = crate::jv::jv_array();
             for name in ["keys", "keys_unsorted", "length", "type", "has", "contains",
                          "to_entries", "sort", "reverse", "add", "floor", "ceil", "round", "sqrt",
-                         "tonumber", "tostring", "tojson", "fromjson", "not", "null",
+                         "tonumber", "tostring", "tojson", "fromjson", "format", "not", "null",
                          "true", "false", "empty", "error", "first", "last", "min", "max",
+                         "_min_by_impl", "_max_by_impl",
                          "unique", "flatten", "getpath", "setpath", "delpaths",
                          "split", "startswith", "endswith", "ltrimstr", "rtrimstr",
+                         "trim", "ltrim", "rtrim",
                          "ascii_downcase", "ascii_upcase", "explode", "implode",
-                         "env", "now", "debug", "stderr", "input", "input_filename",
-                         "input_line_number", "infinite", "nan",
+                         "env", "now", "strftime", "strflocaltime", "mktime", "gmtime", "localtime",
+                         "debug", "stderr", "input", "input_filename",
+                         "input_line_number", "have_decnum", "have_literal_numbers",
+                         "infinite", "nan",
                          "isinfinite", "isnan", "isnormal", "isfinite",
                          "values", "nulls", "booleans", "numbers", "strings", "arrays", "objects",
-                         "iterables", "scalars", "builtins"].iter() {
+                         "iterables", "scalars", "modulemeta", "builtins"].iter() {
                 arr = crate::jv::jv_array_append(arr, Jv::string(name));
             }
             arr

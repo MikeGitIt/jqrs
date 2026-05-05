@@ -605,7 +605,7 @@ pub fn jv_show(x: Jv, flags: i32) {
 }
 /// Dump a jv value to a truncated string buffer
 pub fn jv_dump_string_trunc(x: Jv, bufsize: usize) -> String {
-    let x = jv_dump_string(x, 0);
+    let x = jv_dump_string(x, JV_PRINT_INVALID as i32);
     let p = jv_string_value(&x);
     let len = p.len();
     let mut result = if len <= bufsize - 1 {

@@ -147,6 +147,7 @@ pub struct Bytecode {
     pub subfunctions: Vec<Box<Bytecode>>,
     pub nsubfunctions: i32,
     pub parent: Option<Box<Bytecode>>,
+    pub parent_ptr: Option<*mut Bytecode>,
     pub debuginfo: Jv,
 }
 

@@ -101,6 +101,51 @@ fn rust_reports_broken_stdout() {
 }
 
 #[test]
+fn rust_run_tests_executes_programs_and_compares_outputs() {
+    let rust_bin = rust_jq();
+    let args = vec!["--run-tests".to_string()];
+    let output = run(
+        &rust_bin,
+        &args,
+        Some(b".\nnull\n\"impossible expected output\"\n\n"),
+    );
+    assert_eq!(output.code, 1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("*** Expected \"impossible expected output\", but got null"),
+        "run-tests did not compare actual jq output: {stdout}"
+    );
+    assert!(
+        stdout.contains("0 of 1 tests passed"),
+        "run-tests did not fail the mismatched test: {stdout}"
+    );
+}
+
+#[test]
+fn rust_run_tests_first_jq_cases() {
+    let test_file = PathBuf::from("/Users/mickillah/jq/tests/jq.test");
+    if !test_file.is_file() {
+        eprintln!("skipping jq.test smoke: {} not found", test_file.display());
+        return;
+    }
+    let rust_bin = rust_jq();
+    let args = vec![
+        "--run-tests".to_string(),
+        "--take".to_string(),
+        "20".to_string(),
+        test_file.to_string_lossy().into_owned(),
+    ];
+    let output = run(&rust_bin, &args, None);
+    assert_eq!(
+        output.code,
+        0,
+        "first jq.test cases failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn parity_entrypoint_smoke() {
     let Some(c_bin) = c_jq() else {
         eprintln!("skipping parity smoke: set JQ_C_BIN or build /Users/mickillah/jq/jq");
@@ -337,6 +382,34 @@ fn parity_entrypoint_smoke() {
             "exponent input",
             vec![".m == 0.001".into()],
             Some(b"{\"m\":1e-3}\n".to_vec()),
+        ),
+        (
+            "literal number arithmetic",
+            vec!["-n".into(), "1+0".into()],
+            None,
+        ),
+        (
+            "string interpolation",
+            vec!["-n".into(), "\"inter\\(\"pol\" + \"ation\")\"".into()],
+            None,
+        ),
+        (
+            "html interpolation format",
+            vec!["-n".into(), "@html \"<b>\\(.)</b>\"".into()],
+            Some(b"\"<script>hax</script>\"\n".to_vec()),
+        ),
+        (
+            "shell format",
+            vec!["-n".into(), "\"abc\" | @sh".into()],
+            None,
+        ),
+        (
+            "tojson fromjson collect",
+            vec![
+                "-n".into(),
+                "[\"foo\",1,[\"a\",1,\"b\",2,{\"foo\":\"bar\"}]] | [.[]|tojson|fromjson]".into(),
+            ],
+            None,
         ),
         (
             "single file input",

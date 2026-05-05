@@ -686,6 +686,75 @@ pub fn found_string(p: &mut ExtendedJvParser) -> Presult {
     p.base.tokenpos = 0;
     Presult::Ok
 }
+fn parser_error_message(p: &ExtendedJvParser) -> Option<&'static str> {
+    let err = p.base.error.as_ref()?;
+    let msg = crate::jv::jv_invalid_get_msg(jv_copy(err));
+    let result = if crate::jv::jv_get_kind(&msg) == JvKind::String {
+        match crate::jv::jv_string_value(&msg) {
+            "Expected escape character at end of string" => Some("Expected escape character at end of string"),
+            "Invalid \\uXXXX escape" => Some("Invalid \\uXXXX escape"),
+            "Invalid characters in \\uXXXX escape" => Some("Invalid characters in \\uXXXX escape"),
+            "Invalid \\uXXXX\\uXXXX surrogate pair escape" => {
+                Some("Invalid \\uXXXX\\uXXXX surrogate pair escape")
+            }
+            "Invalid escape" => Some("Invalid escape"),
+            "Invalid string: control characters from U+0000 through U+001F must be escaped" => {
+                Some("Invalid string: control characters from U+0000 through U+001F must be escaped")
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    jv_free(msg);
+    result
+}
+fn string_token_error_message(p: &ExtendedJvParser) -> Option<&'static str> {
+    let mut i = 0;
+    let end = p.base.tokenpos;
+    while i < end {
+        let c = p.base.tokenbuf[i];
+        i += 1;
+        if c == b'\\' {
+            if i >= end {
+                return Some("Expected escape character at end of string");
+            }
+            let escape = p.base.tokenbuf[i];
+            i += 1;
+            match escape {
+                b'\\' | b'"' | b'/' | b'b' | b'f' | b't' | b'n' | b'r' => {}
+                b'u' => {
+                    if i + 4 > end {
+                        return Some("Invalid \\uXXXX escape");
+                    }
+                    let hexvalue = unhex4(&p.base.tokenbuf[i..]);
+                    if hexvalue < 0 {
+                        return Some("Invalid characters in \\uXXXX escape");
+                    }
+                    i += 4;
+                    if (0xD800..=0xDBFF).contains(&(hexvalue as u32)) {
+                        if i + 6 > end || p.base.tokenbuf[i] != b'\\'
+                            || p.base.tokenbuf[i + 1] != b'u'
+                        {
+                            return Some("Invalid \\uXXXX\\uXXXX surrogate pair escape");
+                        }
+                        let surrogate = unhex4(&p.base.tokenbuf[i + 2..]);
+                        if surrogate < 0
+                            || !(0xDC00..=0xDFFF).contains(&(surrogate as u32))
+                        {
+                            return Some("Invalid \\uXXXX\\uXXXX surrogate pair escape");
+                        }
+                        i += 6;
+                    }
+                }
+                _ => return Some("Invalid escape"),
+            }
+        } else if c <= 0x1f {
+            return Some("Invalid string: control characters from U+0000 through U+001F must be escaped");
+        }
+    }
+    None
+}
 /// Add a character to the token buffer
 pub fn tokenadd(p: &mut ExtendedJvParser, c: u8) {
     if p.tokenlen == 0 {
@@ -851,7 +920,9 @@ pub fn scan(p: &mut ExtendedJvParser, ch: u8, out: &mut Jv) -> Option<&'static s
         if ch == b'"' && p.st == JvParserState::String {
             let result = found_string(p);
             if result == Presult::Error {
-                return Some("String parse error");
+                return string_token_error_message(p)
+                    .or_else(|| parser_error_message(p))
+                    .or(Some("String parse error"));
             }
             p.st = JvParserState::Normal;
             let check_done = if (p.base.flags & flags::JV_PARSE_STREAMING) != 0 {
@@ -1312,25 +1383,7 @@ pub fn jv_parse(string: &str) -> Jv {
 }
 /// Parse a JSON string with explicit length
 pub fn jv_parse_sized(string: &str, length: i32) -> Jv {
-    let debug = std::env::var("DEBUG_PARSER").is_ok();
-    let mut parser = jv_parser_new(0);
-    jv_parser_set_buf(&mut parser, string.as_bytes(), length, false);
-    let value = jv_parser_next(&mut parser);
-    if debug {
-        eprintln!("DEBUG jv_parse_sized: input={:?} len={} -> kind={:?} is_valid={}",
-            string, length, value.get_kind(), value.is_valid());
-    }
-    if value.is_valid() {
-        let next = jv_parser_next(&mut parser);
-        if next.is_valid() {
-            jv_free(next);
-            jv_free(value);
-            return Jv::invalid_with_msg(
-                Jv::string("Unexpected extra JSON values"),
-            );
-        }
-    }
-    value
+    jv_parse_sized_custom_flags(string, length, 0)
 }
 /// UTF-8 BOM bytes
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -1428,6 +1481,27 @@ pub fn jv_parse_sized_custom_flags(string: &str, length: i32, flags: i32) -> Jv 
     parser_init(&mut parser, flags);
     jv_parser_set_buf(&mut parser, string.as_bytes(), length, false);
     let value = jv_parser_next(&mut parser);
+    if !crate::jv::jv_is_valid(&value) {
+        if crate::jv::jv_invalid_has_msg(jv_copy(&value)) != 0 {
+            let msg = crate::jv::jv_invalid_get_msg(jv_copy(&value));
+            let msg_str = if crate::jv::jv_get_kind(&msg) == JvKind::String {
+                crate::jv::jv_string_value(&msg).to_string()
+            } else {
+                "<unknown error>".to_string()
+            };
+            let result = Jv::invalid_with_msg(
+                Jv::string(&format!("{} (while parsing '{}')", msg_str, string)),
+            );
+            jv_free(msg);
+            jv_free(value);
+            parser_free(&mut parser);
+            return result;
+        }
+        jv_free(value);
+        let result = Jv::invalid_with_msg(Jv::string("Expected JSON value"));
+        parser_free(&mut parser);
+        return result;
+    }
     if value.is_valid() {
         let next = jv_parser_next(&mut parser);
         if next.is_valid() {
@@ -1445,23 +1519,8 @@ pub fn jv_parse_sized_custom_flags(string: &str, length: i32, flags: i32) -> Jv 
         } else {
             jv_free(next);
         }
-    } else if value.clone().invalid_has_msg() {} else {
-        jv_free(value);
-        let result = Jv::invalid_with_msg(Jv::string("Expected JSON value"));
-        parser_free(&mut parser);
-        return result;
     }
     parser_free(&mut parser);
-    if !value.is_valid() && value.clone().invalid_has_msg() {
-        let msg = value.clone().invalid_get_msg();
-        let msg_str = msg.string_value().unwrap_or("<unknown error>");
-        let result = Jv::invalid_with_msg(
-            Jv::string(&format!("{} (while parsing '{}')", msg_str, string)),
-        );
-        jv_free(msg);
-        jv_free(value);
-        return result;
-    }
     value
 }
 /// Check if a Jv value is valid

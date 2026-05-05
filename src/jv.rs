@@ -475,6 +475,11 @@ pub fn jvp_object_get_slot_mut(object: &mut Jv, slot: i32) -> Option<&mut Object
         jvp_object_ptr_mut(object).and_then(|obj| obj.elements.get_mut(slot as usize))
     }
 }
+
+fn jvp_object_slot_live(slot: &ObjectSlot) -> bool {
+    jv_get_kind(&slot.string) == JvKind::String
+}
+
 /// Set object value by key
 pub fn jv_object_set(mut j: Jv, key: Jv, val: Jv) -> Jv {
     assert!(jvp_has_kind(&j, JvKind::Object));
@@ -487,7 +492,7 @@ pub fn jv_object_set(mut j: Jv, key: Jv, val: Jv) -> Jv {
         jv_free(key_clone);
         // Linear search for existing key
         for slot in &mut obj.elements {
-            if slot.hash == key_hash && jv_equal(&slot.string, &key) {
+            if jvp_object_slot_live(slot) && slot.hash == key_hash && jv_equal(&slot.string, &key) {
                 jv_free(key);
                 let old = std::mem::replace(&mut slot.value, val);
                 jv_free(old);
@@ -523,7 +528,7 @@ pub fn jvp_object_write<'a>(object: &'a mut Jv, key: &Jv) -> Option<&'a mut Jv> 
 
     // Linear search for existing key
     for (idx, slot) in obj.elements.iter().enumerate() {
-        if slot.hash == hash && jv_string_equal(&slot.string, key) {
+        if jvp_object_slot_live(slot) && slot.hash == hash && jv_string_equal(&slot.string, key) {
             return Some(&mut obj.elements[idx].value);
         }
     }
@@ -590,12 +595,13 @@ fn jvp_object_contains(a: &Jv, b: &Jv) -> i32 {
     let obj_b = unsafe { &*(b.u as *const JvpObject) };
 
     for slot in &obj_b.elements {
-        if slot.hash != 0 {
+        if jvp_object_slot_live(slot) {
             let found = obj_a
                 .elements
                 .iter()
                 .any(|s| {
-                    s.hash == slot.hash
+                    jvp_object_slot_live(s)
+                        && s.hash == slot.hash
                         && jv_string_equal(&s.string, &slot.string)
                         && jv_contains(jv_copy(&s.value), jv_copy(&slot.value)) != 0
                 });
@@ -659,6 +665,12 @@ pub fn jv_copy(j: &Jv) -> Jv {
                 }
             }
         }
+        JvKind::Array => {
+            if j.u != 0 {
+                let arr = unsafe { &mut *(j.u as *mut JvpArray) };
+                arr.refcnt += 1;
+            }
+        }
         JvKind::Object => {
             if let Ok(mut storage) = OBJECT_STORAGE.lock() {
                 if let Some(obj) = storage.get_mut(&j.u) {
@@ -671,6 +683,12 @@ pub fn jv_copy(j: &Jv) -> Jv {
                 if let Some(num) = storage.get_mut(&j.u) {
                     num.refcnt += 1;
                 }
+            }
+        }
+        JvKind::Invalid => {
+            if j.u != 0 && (j.kind_flags & JVP_PAYLOAD_ALLOCATED) != 0 {
+                let inv = unsafe { &mut *(j.u as *mut JvpInvalid) };
+                inv.refcnt += 1;
             }
         }
         _ => {}
@@ -757,7 +775,7 @@ pub fn jv_array_sized(size: i32) -> Jv {
         refcnt: 1,
         length: 0,
         alloc_length: size,
-        elements: Vec::with_capacity(size as usize),
+        elements: vec![jv_null(); size as usize],
     });
     let ptr = Box::into_raw(arr);
     Jv {
@@ -782,7 +800,7 @@ pub fn jv_equal(a: &Jv, b: &Jv) -> bool {
     }
     match kind_a {
         JvKind::Null | JvKind::True | JvKind::False => true,
-        JvKind::Number => jv_number_value(a) == jv_number_value(b),
+        JvKind::Number => jvp_number_equal(a, b) != 0,
         JvKind::String => jv_string_value(a) == jv_string_value(b),
         JvKind::Array => {
             let len_a = jv_array_length(a);
@@ -800,22 +818,7 @@ pub fn jv_equal(a: &Jv, b: &Jv) -> bool {
             true
         }
         JvKind::Object => {
-            let len_a = jv_object_length(a);
-            let len_b = jv_object_length(b);
-            if len_a != len_b {
-                return false;
-            }
-            let mut iter = jv_object_iter(a);
-            while jv_object_iter_valid(a, iter) {
-                let key = jv_object_iter_key(a, iter);
-                let val_a = jv_object_iter_value(a, iter);
-                let val_b = jv_object_get(b, jv_copy(&key));
-                if !jv_equal(&val_a, &val_b) {
-                    return false;
-                }
-                iter = jv_object_iter_next(a, iter);
-            }
-            true
+            jvp_object_equal(a, b)
         }
         JvKind::Invalid => false,
     }
@@ -855,28 +858,22 @@ pub fn jvp_object_equal(a: &Jv, b: &Jv) -> bool {
     if a.u == 0 || b.u == 0 {
         return false;
     }
-    let obj_a = unsafe { &*(a.u as *const JvpObject) };
-    let obj_b = unsafe { &*(b.u as *const JvpObject) };
-
-    let count_a = obj_a.elements.iter().filter(|s| s.hash != 0).count();
-    let count_b = obj_b.elements.iter().filter(|s| s.hash != 0).count();
-    if count_a != count_b {
+    if jv_object_length(a) != jv_object_length(b) {
         return false;
     }
-    for slot_a in &obj_a.elements {
-        if slot_a.hash != 0 {
-            let found = obj_b
-                .elements
-                .iter()
-                .any(|slot_b| {
-                    slot_b.hash == slot_a.hash
-                        && jv_string_equal(&slot_a.string, &slot_b.string)
-                        && jv_equal(&slot_a.value, &slot_b.value)
-                });
-            if !found {
-                return false;
-            }
+
+    let mut iter = jv_object_iter(a);
+    while jv_object_iter_valid(a, iter) {
+        let key = jv_object_iter_key(a, iter);
+        let val_a = jv_object_iter_value(a, iter);
+        if !jv_object_has_key(b, &key) {
+            return false;
         }
+        let val_b = jv_object_get(b, jv_copy(&key));
+        if !jv_equal(&val_a, &val_b) {
+            return false;
+        }
+        iter = jv_object_iter_next(a, iter);
     }
     true
 }
@@ -1043,6 +1040,10 @@ pub fn jv_is_valid(x: &Jv) -> bool {
 /// Get numeric value from jv
 pub fn jv_number_value(j: &Jv) -> f64 {
     assert!(jvp_has_kind(j, JvKind::Number));
+    if (j.kind_flags & JVP_FLAGS_NUMBER_LITERAL) != 0 && j.u != 0 {
+        let n = unsafe { &*(j.u as *const JvpLiteralNumber) };
+        return n.num_double;
+    }
     let is_decimal = j.kind_flags
         == (JvKind::Number as u8 | ((JVP_NUMBER_DECIMAL << 4) & 0x70)
             | JVP_PAYLOAD_ALLOCATED);
@@ -1136,6 +1137,12 @@ pub fn jvp_refcnt_inc(j: &Jv) {
             if (j.kind_flags & JVP_FLAGS_NUMBER_LITERAL) != 0 {
                 let n = unsafe { &mut *(j.u as *mut JvpLiteralNumber) };
                 n.refcnt += 1;
+            }
+        }
+        JvKind::Invalid => {
+            if j.kind_flags & JVP_PAYLOAD_ALLOCATED != 0 {
+                let inv = unsafe { &mut *(j.u as *mut JvpInvalid) };
+                inv.refcnt += 1;
             }
         }
         _ => {}
@@ -1310,7 +1317,14 @@ pub fn jvp_string_free(js: Jv) {
 }
 /// Create a new literal number from string
 pub fn jvp_literal_number_new(literal: &str) -> Jv {
-    let parsed = literal.parse::<f64>();
+    let lower = literal.to_ascii_lowercase();
+    let parsed = if lower == "nan" || lower.strip_prefix("nan")
+        .is_some_and(|payload| !payload.is_empty() && payload.bytes().all(|b| b.is_ascii_digit()))
+    {
+        Ok(f64::NAN)
+    } else {
+        literal.parse::<f64>()
+    };
     match parsed {
         Ok(val) => {
             let n = Box::new(JvpLiteralNumber {
@@ -1488,11 +1502,7 @@ pub fn jv_array() -> Jv {
 /// Get array length
 pub fn jv_array_length(j: &Jv) -> i32 {
     assert!(jvp_has_kind(j, JvKind::Array));
-    if j.u == 0 {
-        return 0;
-    }
-    let arr = unsafe { &*(j.u as *const JvpArray) };
-    arr.length
+    j.size
 }
 /// Get element from array at index
 pub fn jv_array_get(a: Jv, idx: i32) -> Jv {
@@ -1506,12 +1516,13 @@ pub fn jv_array_get(a: Jv, idx: i32) -> Jv {
     let result = match jvp_array_ptr(&a) {
         Some(ptr) => {
             let arr = unsafe { &*ptr };
-            if debug { eprintln!("jv_array_get: idx={} a.size={} arr.elements.len={} arr.length={}", idx, a.size, arr.elements.len(), arr.length); }
-            if (idx as usize) < arr.elements.len() {
-                jv_copy(&arr.elements[idx as usize])
+            let actual_idx = idx + a.offset as i32;
+            if debug { eprintln!("jv_array_get: idx={} actual_idx={} a.size={} arr.elements.len={} arr.length={}", idx, actual_idx, a.size, arr.elements.len(), arr.length); }
+            if actual_idx >= 0 && (actual_idx as usize) < arr.elements.len() {
+                jv_copy(&arr.elements[actual_idx as usize])
             } else {
-                if debug { eprintln!("jv_array_get: idx {} >= elements.len {}, returning null", idx, arr.elements.len()); }
-                Jv::null()
+                if debug { eprintln!("jv_array_get: actual_idx {} out of elements.len {}, returning invalid", actual_idx, arr.elements.len()); }
+                Jv::invalid()
             }
         }
         None => {
@@ -1523,25 +1534,22 @@ pub fn jv_array_get(a: Jv, idx: i32) -> Jv {
     result
 }
 /// Set array element
-pub fn jv_array_set(mut j: Jv, idx: i32, val: Jv) -> Jv {
+pub fn jv_array_set(mut j: Jv, mut idx: i32, val: Jv) -> Jv {
     assert!(jvp_has_kind(&j, JvKind::Array));
-    if j.u == 0 {
-        return j;
+    if idx < 0 {
+        idx += jvp_array_length(&j);
     }
-    let arr = unsafe { &mut *(j.u as *mut JvpArray) };
-    while idx >= arr.elements.len() as i32 {
-        arr.elements.push(jv_null());
+    if idx < 0 {
+        jv_free(j);
+        jv_free(val);
+        return jv_invalid_with_msg(jv_string("Out of bounds negative array index"));
     }
-    if idx >= 0 {
-        let old = std::mem::replace(&mut arr.elements[idx as usize], val);
+
+    if let Some(slot) = jvp_array_write(&mut j, idx) {
+        let old = std::mem::replace(slot, val);
         jv_free(old);
-        if idx >= arr.length {
-            arr.length = idx + 1;
-        }
-        // CRITICAL: update j.size to match arr.length (C does: a->size = imax(i + 1, a->size))
-        if idx + 1 > j.size {
-            j.size = idx + 1;
-        }
+    } else {
+        jv_free(val);
     }
     j
 }
@@ -1552,7 +1560,7 @@ pub fn jv_object_length(j: &Jv) -> i32 {
         return 0;
     }
     let obj = unsafe { &*(j.u as *const JvpObject) };
-    obj.next_free
+    obj.elements.iter().filter(|slot| jvp_object_slot_live(slot)).count() as i32
 }
 /// Get object value by key
 pub fn jv_object_get(j: &Jv, key: Jv) -> Jv {
@@ -1566,7 +1574,7 @@ pub fn jv_object_get(j: &Jv, key: Jv) -> Jv {
     let key_hash = jvp_string_hash(&key);
     // Linear search through elements
     for slot in &obj.elements {
-        if slot.hash == key_hash && jv_equal(&slot.string, &key) {
+        if jvp_object_slot_live(slot) && slot.hash == key_hash && jv_equal(&slot.string, &key) {
             jv_free(key);
             return jv_copy(&slot.value);
         }
@@ -1574,6 +1582,20 @@ pub fn jv_object_get(j: &Jv, key: Jv) -> Jv {
     jv_free(key);
     jv_null()
 }
+
+pub fn jv_object_has_key(j: &Jv, key: &Jv) -> bool {
+    assert!(jvp_has_kind(j, JvKind::Object));
+    assert!(jvp_has_kind(key, JvKind::String));
+    if j.u == 0 {
+        return false;
+    }
+    let obj = unsafe { &*(j.u as *const JvpObject) };
+    let key_hash = jvp_string_hash(key);
+    obj.elements.iter().any(|slot| {
+        jvp_object_slot_live(slot) && slot.hash == key_hash && jv_equal(&slot.string, key)
+    })
+}
+
 /// Object iterator - returns first index
 /// C: int jv_object_iter(jv object) { return jv_object_iter_next(object, -1); }
 pub fn jv_object_iter(j: &Jv) -> i32 {
@@ -1665,11 +1687,7 @@ fn jvp_array_ptr_mut(a: &mut Jv) -> Option<&mut JvpArray> {
 /// Internal: get array length
 fn jvp_array_length(a: &Jv) -> i32 {
     assert!(jvp_has_kind(a, JvKind::Array));
-    if a.u == 0 {
-        return 0;
-    }
-    let arr = unsafe { &*(a.u as *const JvpArray) };
-    arr.length - a.offset as i32
+    a.size
 }
 /// Get the offset of an array
 fn jvp_array_offset(a: Jv) -> i32 {
@@ -2004,7 +2022,7 @@ pub fn jv_array_indexes(a: Jv, b: Jv) -> Jv {
         for bi in 0..blen {
             let belem = jv_array_get(jv_copy_internal(&b), bi);
             let aelem = jv_array_get(jv_copy_internal(&a), ai + bi);
-            if !jv_equal_internal(&aelem, &belem) {
+            if !jv_equal(&aelem, &belem) {
                 idx = -1;
             } else if bi == 0 && idx == -1 {
                 idx = ai;
@@ -2013,7 +2031,7 @@ pub fn jv_array_indexes(a: Jv, b: Jv) -> Jv {
             jv_free(belem);
         }
         if idx > -1 {
-            res = jv_array_append_internal(res, jv_number(idx as f64));
+            res = jv_array_append(res, jv_number(idx as f64));
         }
     }
     jv_free(a);
@@ -2048,7 +2066,7 @@ fn jv_equal_internal(a: &Jv, b: &Jv) -> bool {
     }
     match jv_kind(a) {
         JvKind::Null | JvKind::True | JvKind::False => true,
-        JvKind::Number => jv_number_value(a) == jv_number_value(b),
+        JvKind::Number => jvp_number_equal(a, b) != 0,
         JvKind::String => jv_string_value(a) == jv_string_value(b),
         JvKind::Array => {
             let alen = jv_array_length(a);
@@ -2179,10 +2197,49 @@ pub fn jv_string_append_codepoint(s: Jv, codepoint: u32) -> Jv {
 pub fn jvp_number_cmp(a: &Jv, b: &Jv) -> i32 {
     assert!(a.has_kind(JvKind::Number), "JVP_HAS_KIND(a, JV_KIND_NUMBER)");
     assert!(b.has_kind(JvKind::Number), "JVP_HAS_KIND(b, JV_KIND_NUMBER)");
-    if a.is_literal_number() && b.is_literal_number() {}
+    if let (Some((a_neg, a_digits)), Some((b_neg, b_digits))) =
+        (normalized_integer_literal(a), normalized_integer_literal(b))
+    {
+        if a_neg != b_neg {
+            return if a_neg { -1 } else { 1 };
+        }
+        let ord = if a_digits.len() != b_digits.len() {
+            a_digits.len().cmp(&b_digits.len())
+        } else {
+            a_digits.cmp(&b_digits)
+        };
+        return match ord {
+            std::cmp::Ordering::Less => if a_neg { 1 } else { -1 },
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => if a_neg { -1 } else { 1 },
+        };
+    }
     let da = jv_number_value(a);
     let db = jv_number_value(b);
     if da < db { -1 } else if da == db { 0 } else { 1 }
+}
+fn normalized_integer_literal(n: &Jv) -> Option<(bool, String)> {
+    let literal = jv_number_get_literal(n)?;
+    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
+        return None;
+    }
+    let mut s = literal.as_str();
+    let mut negative = false;
+    if let Some(rest) = s.strip_prefix('-') {
+        negative = true;
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix('+') {
+        s = rest;
+    }
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits = s.trim_start_matches('0');
+    if digits.is_empty() {
+        Some((false, "0".to_string()))
+    } else {
+        Some((negative, digits.to_string()))
+    }
 }
 /// Thread-local decimal context key
 pub static dec_ctx_key: std::sync::OnceLock<DecimalContext> = std::sync::OnceLock::new();
@@ -2193,7 +2250,7 @@ fn jvp_array_alloc(size: i32) -> Box<JvpArray> {
         refcnt: 1,
         length: 0,
         alloc_length: size,
-        elements: Vec::with_capacity(size as usize),
+        elements: vec![jv_null(); size as usize],
     })
 }
 fn jv_equal_by_kind(a: &Jv, b: &Jv) -> i32 {
@@ -2225,7 +2282,7 @@ pub fn jvp_object_find_slot<'a>(
     let hash = jvp_string_hash(keystr);
     let mut curr_opt = jvp_object_get_slot(object, *bucket);
     while let Some(curr) = curr_opt {
-        if curr.hash == hash && jvp_string_equal(keystr, &curr.string) {
+        if jvp_object_slot_live(curr) && curr.hash == hash && jvp_string_equal(keystr, &curr.string) {
             return Some(curr);
         }
         curr_opt = jvp_object_next_slot(object, curr);
@@ -2553,7 +2610,7 @@ pub fn jvp_number_is_nan(n: Jv) -> i32 {
         }
         0
     } else {
-        let number = f64::from_bits(n.u);
+        let number = jv_number_value(&n);
         if number != number { 1 } else { 0 }
     }
 }
@@ -2601,7 +2658,7 @@ fn jv_get_payload(jv: &Jv) -> JvPayload {
                 refcnt: 1,
                 length: jv.size,
                 alloc_length: jv.size,
-                elements: Vec::new(),
+                elements: vec![jv_null(); jv.size as usize],
             })
         }
         _ => {
@@ -3016,7 +3073,7 @@ impl JvpArray {
             refcnt: 1,
             length: 0,
             alloc_length: capacity,
-            elements: Vec::with_capacity(capacity as usize),
+            elements: vec![jv_null(); capacity as usize],
         })
     }
 }
@@ -3235,7 +3292,7 @@ impl Jv {
     /// Get number value
     pub fn number_value(&self) -> f64 {
         if self.kind() == JvKind::Number {
-            f64::from_bits(self.u)
+            jv_number_value(self)
         } else {
             0.0
         }
@@ -3369,4 +3426,3 @@ impl Default for JvRefcntStruct {
         Self { count: 1 }
     }
 }
-

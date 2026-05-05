@@ -23,62 +23,12 @@ use crate::jv::{
 // Note: jv_object_get is defined locally as a stub in this file
 use crate::jv_file::jv_load_file;
 use crate::locfile::{locfile_init, locfile_free};
-use crate::parser::gen_noop;
-// FIXME: CRITICAL - This file has a fundamental type mismatch issue.
-// compile:: functions use compile::Block while parser:: and types:: use types::Block.
-// These are incompatible types. The following are stub implementations to make the file
-// compile, but the functionality is broken. This requires architectural changes to:
-// - types.rs: Add Clone derive to Block, or
-// - Unify Block types across compile.rs, parser.rs, and types.rs
-// Original imports commented out:
-// use crate::compile::{
-//     block_bind_self, block_drop_unreferenced, block_free, block_has_main,
-//     block_is_const, block_join, block_list_funcs, block_module_meta, block_take_imports,
-//     gen_const, gen_const_global, gen_import, gen_import_meta, block_bind_library,
-// };
-
-// Local stub implementations using types::Block
-const OP_IS_CALL_PSEUDO: i32 = 16;
-fn block_take_imports(_body: &mut Block) -> Jv {
-    jv_array()
-}
-fn block_bind_library(_binder: Block, body: Block, _bindflags: i32, _libname: Option<&str>) -> Block {
-    body
-}
-fn block_bind_self(binder: Block, _bindflags: i32) -> Block {
-    binder
-}
-fn gen_const_global(_constant: Jv, _name: &str) -> Block {
-    Block::default()
-}
-fn block_has_main(_program: &Block) -> bool {
-    true
-}
-fn block_free(_block: Block) {}
-fn block_join(a: Block, _b: Block) -> Block {
-    a
-}
-fn gen_import(_path: &str, _as_name: Option<&str>, _is_optional: i32) -> Block {
-    Block::default()
-}
-fn gen_import_meta(import: Block, _meta: Block) -> Block {
-    import
-}
-fn gen_const(_value: Jv) -> Block {
-    Block::default()
-}
-fn block_is_const(_b: &Block) -> i32 {
-    0
-}
-fn block_drop_unreferenced(block: Block) -> Block {
-    block
-}
-fn block_module_meta(_program: &Block) -> Jv {
-    jv_null()
-}
-fn block_list_funcs(_body: Block, _omit_underscores: i32) -> Jv {
-    jv_array()
-}
+use crate::compile::{
+    OP_IS_CALL_PSEUDO, block_bind_library, block_bind_self, block_drop_unreferenced,
+    block_free, block_has_main, block_is_const, block_join, block_list_funcs,
+    block_module_meta, block_take_imports, gen_const, gen_const_global, gen_import,
+    gen_import_meta, gen_noop,
+};
 use crate::execute::{
     jq_get_jq_origin, jq_get_lib_dirs, jq_get_prog_origin,
     jq_report_error,
@@ -104,12 +54,10 @@ pub fn jv_basename(path: Jv) -> Jv {
 fn validate_relpath(name: Jv) -> Jv {
     let s = jv_string_value(&name);
     if s.contains('\\') {
-        let res = jv_invalid_with_msg(
-            jv_string_fmt(
-                "Modules must be named by relative paths using '/', not '\\' ({})",
-                format_args!("{}", s),
-            ),
-        );
+        let res = jv_invalid_with_msg(jv_string(&format!(
+            "Modules must be named by relative paths using '/', not '\\' ({})",
+            s
+        )));
         jv_free(name);
         return res;
     }
@@ -121,12 +69,10 @@ fn validate_relpath(name: Jv) -> Jv {
         if x_str == ".." {
             jv_free(x);
             jv_free(components);
-            let res = jv_invalid_with_msg(
-                jv_string_fmt(
+                let res = jv_invalid_with_msg(jv_string(&format!(
                     "Relative paths to modules may not traverse to parent directories ({})",
-                    format_args!("{}", s),
-                ),
-            );
+                    s
+                )));
             jv_free(name);
             return res;
         }
@@ -137,12 +83,10 @@ fn validate_relpath(name: Jv) -> Jv {
                 jv_free(x);
                 jv_free(components);
                 let name_str = jv_string_value(&name);
-                let res = jv_invalid_with_msg(
-                    jv_string_fmt(
-                        "module names must not have equal consecutive components: {}",
-                        format_args!("{}", name_str),
-                    ),
-                );
+                let res = jv_invalid_with_msg(jv_string(&format!(
+                    "module names must not have equal consecutive components: {}",
+                    name_str
+                )));
                 jv_free(name);
                 return res;
             }
@@ -187,14 +131,14 @@ pub fn find_lib<T>(
         jv_free(search);
         jv_free(jq_origin);
         jv_free(lib_origin);
-        return jv_invalid_with_msg(jv_string_fmt("Module path must be a string", format_args!("")));
+        return jv_invalid_with_msg(jv_string("Module path must be a string"));
     }
     if jv_get_kind(&search) != JvKind::Array {
         jv_free(rel_path);
         jv_free(search);
         jv_free(jq_origin);
         jv_free(lib_origin);
-        return jv_invalid_with_msg(jv_string_fmt("Module search path must be an array", format_args!("")));
+        return jv_invalid_with_msg(jv_string("Module search path must be an array"));
     }
     let search = build_lib_search_chain(jq, search, jq_origin, lib_origin);
     let err = jv_array_get(jv_copy(&search), 1);
@@ -249,15 +193,14 @@ pub fn find_lib<T>(
     if !jv_is_valid(&err) {
         let err_msg = jv_invalid_get_msg(err);
         let err_str = jv_string_value(&err_msg);
-        output = jv_invalid_with_msg(
-            jv_string_fmt("module not found: {} ({})", format_args!("{}, {}", rel_path_str, err_str)),
-        );
+        output = jv_invalid_with_msg(jv_string(&format!(
+            "module not found: {} ({})",
+            rel_path_str, err_str
+        )));
         jv_free(err_msg);
     } else {
         jv_free(err);
-        output = jv_invalid_with_msg(
-            jv_string_fmt("module not found: {}", format_args!("{}", rel_path_str)),
-        );
+        output = jv_invalid_with_msg(jv_string(&format!("module not found: {}", rel_path_str)));
     }
     jv_free(rel_path);
     jv_free(search);
@@ -293,12 +236,12 @@ pub fn build_lib_search_chain<T>(
         } else if path_str.starts_with("$ORIGIN/") {
             let origin_str = jv_string_value(&jq_origin);
             let suffix = &path_str["$ORIGIN/".len()..];
-            expanded_elt = jv_string_fmt("{}/{}", format_args!("{}, {}", origin_str, suffix));
+            expanded_elt = jv_string(&format!("{}/{}", origin_str, suffix));
         } else if jv_get_kind(&lib_origin) == JvKind::String
             && path_is_relative(jv_copy(&path)) != 0
         {
             let lib_origin_str = jv_string_value(&lib_origin);
-            expanded_elt = jv_string_fmt("{}/{}", format_args!("{}, {}", lib_origin_str, path_str));
+            expanded_elt = jv_string(&format!("{}/{}", lib_origin_str, path_str));
         } else {
             expanded_elt = path;
             path = jv_null();
@@ -365,7 +308,7 @@ pub fn process_dependencies<T>(
             let emsg = jv_invalid_get_msg(resolved);
             jq_report_error(
                 jq,
-                jv_string_fmt("jq: error: {}\n", format_args!("{}", jv_string_value(& emsg))),
+                jv_string(&format!("jq: error: {}\n", jv_string_value(& emsg))),
             );
             jv_free(emsg);
             jv_free(deps);
@@ -387,13 +330,18 @@ pub fn process_dependencies<T>(
                     lib_state,
                 );
             if nerrors == 0 {
-                // FIXME: types::Block doesn't implement Clone; second bind call uses the original
-                // and first bind call is skipped (was using clone)
+                let dep_def_block_copy = dep_def_block.clone();
                 bk = block_bind_library(
                     dep_def_block,
                     bk,
                     OP_IS_CALL_PSEUDO,
                     as_str.as_deref(),
+                );
+                bk = block_bind_library(
+                    dep_def_block_copy,
+                    bk,
+                    OP_IS_CALL_PSEUDO,
+                    None,
                 );
             }
         } else {
@@ -407,8 +355,7 @@ pub fn process_dependencies<T>(
             }
             if let Some(idx) = state_idx {
                 jv_free(resolved);
-                // FIXME: types::Block doesn't implement Clone; taking the block leaves a default
-                let cached_block = std::mem::take(&mut lib_state.defs[idx]);
+                let cached_block = lib_state.defs[idx].clone();
                 bk = block_bind_library(
                     cached_block,
                     bk,
@@ -447,6 +394,21 @@ pub fn process_dependencies<T>(
     nerrors
 }
 /// Load a library from a file path
+fn load_data_file(filename: &str) -> Jv {
+    match std::fs::read_to_string(filename) {
+        Ok(contents) => {
+            let value = crate::jv_parse::jv_parse(&contents);
+            if jv_is_valid(&value) {
+                jv_array_append(jv_array(), value)
+            } else {
+                value
+            }
+        }
+        Err(e) => jv_invalid_with_msg(jv_string(&format!("Could not open {}: {}", filename, e))),
+    }
+}
+
+/// Load a library from a file path
 fn load_library<T>(
     jq: &mut JqState<T>,
     lib_path: Jv,
@@ -460,7 +422,7 @@ fn load_library<T>(
     let mut nerrors = 0;
     let program: Block;
     let data = if is_data != 0 && raw == 0 {
-        jv_load_file(jv_string_value(&lib_path), false)
+        load_data_file(jv_string_value(&lib_path))
     } else {
         jv_load_file(jv_string_value(&lib_path), true)
     };
@@ -476,10 +438,10 @@ fn load_library<T>(
             let err_data_str = jv_string_value(&err_data);
             jq_report_error(
                 jq,
-                jv_string_fmt(
+                jv_string(&format!(
                     "jq: error loading data file {}: {}\n",
-                    format_args!("{}, {}", lib_path_str, err_data_str),
-                ),
+                    lib_path_str, err_data_str
+                )),
             );
             jv_free(err_data);
             nerrors += 1;
@@ -517,9 +479,7 @@ fn load_library<T>(
     let _state_idx = lib_state.ct as usize;
     lib_state.ct += 1;
     lib_state.names.push(jv_string_value(&lib_path).to_string());
-    // FIXME: types::Block doesn't implement Clone, so we can't store and return the same block
-    // This will cause issues when trying to reuse cached blocks
-    lib_state.defs.push(Block::default());
+    lib_state.defs.push(program.clone());
     *out_block = program;
     jv_free(lib_path);
     jv_free(data);
@@ -626,9 +586,15 @@ pub fn load_module_meta<T>(jq: &mut JqState<T>, mod_relpath: Jv) -> Jv {
 }
 fn jv_object_get(obj: Jv, key: Jv) -> Jv {
     use crate::jv::jv_object_get as jv_obj_get;
-    let result = jv_obj_get(&obj, key);
-    jv_free(obj);
-    result
+    if crate::jv::jv_object_has_key(&obj, &key) {
+        let result = jv_obj_get(&obj, key);
+        jv_free(obj);
+        result
+    } else {
+        jv_free(obj);
+        jv_free(key);
+        Jv::invalid()
+    }
 }
 impl Default for LibLoadingState {
     fn default() -> Self {

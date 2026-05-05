@@ -140,6 +140,9 @@ fn dump_block(b: &Block, prefix: &str) {
 }
 
 fn object_has_key(object: &Jv, key: &str) -> bool {
+    if jv_get_kind(object) != JvKind::Object {
+        return false;
+    }
     let mut iter = jv_object_iter(object);
     while jv_object_iter_valid(object, iter) {
         let object_key = jv_object_iter_key(object, iter);
@@ -151,6 +154,18 @@ fn object_has_key(object: &Jv, key: &str) -> bool {
         iter = jv_object_iter_next(object, iter);
     }
     false
+}
+
+fn record_compile_error(lf: &mut Locfile, source: &Location, msg: &str) {
+    if lf.error.is_some() {
+        return;
+    }
+    let line = if source.start >= 0 && source.start < lf.length {
+        lf.locfile_get_line(source.start) + 1
+    } else {
+        1
+    };
+    lf.error = Some(format!("jq: error: {} at {}, line {}:", msg, lf.fname, line));
 }
 
 /// Local OpcodeDesc for this module
@@ -893,9 +908,13 @@ pub fn gen_label(label: &str, exp: Block) -> Block {
 /// Generate a reduce expression
 pub fn gen_reduce(source: Block, matcher: Block, init: Block, body: Block) -> Block {
     let res_var = gen_op_var_fresh(STOREV, "reduce");
+    let res_var_ptr = res_var.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+    let load_for_body = gen_op_bound_to_ptr(LOADVN, res_var_ptr);
+    let store_for_body = gen_op_bound_to_ptr(STOREV, res_var_ptr);
+    let final_load = gen_op_bound_to_ptr(LOADVN, res_var_ptr);
     let inner_body = block_join(
-        block_join(gen_op_bound(LOADVN, &res_var), body),
-        gen_op_bound(STOREV, &res_var),
+        block_join(load_for_body, body),
+        store_for_body,
     );
     let loop_block = block_join(
         block_join(
@@ -907,12 +926,12 @@ pub fn gen_reduce(source: Block, matcher: Block, init: Block, body: Block) -> Bl
     block_join(
         block_join(
             block_join(
-                block_join(block_join(gen_op_simple(DUP), init), res_var.clone()),
+                block_join(block_join(gen_op_simple(DUP), init), res_var),
                 gen_op_target(FORK, &loop_block),
             ),
             loop_block,
         ),
-        gen_op_bound(LOADVN, &res_var),
+        final_load,
     )
 }
 /// Generate an array matcher
@@ -969,12 +988,20 @@ pub fn gen_array_matcher(left: Block, curr: Block) -> Block {
     )
 }
 /// Calculate nesting level between bytecode and target instruction
-fn nesting_level(_bc: &mut Bytecode, _target: *mut Inst) -> u16 {
-    // The Inst struct doesn't have a 'compiled' field in this implementation.
-    // This function calculates the nesting level by traversing the bytecode parent chain.
-    // Since Bytecode.parent is Box<Bytecode>, not Rc<RefCell<>>, we'd need to track depth differently.
-    // For now, return 0 as a placeholder.
-    0
+fn nesting_level(bc: &mut Bytecode, target: *mut Inst) -> u16 {
+    assert!(!target.is_null(), "target must not be null");
+    let target_bc = unsafe { (*target).compiled }
+        .expect("target instruction must have compiled bytecode");
+    let mut level = 0u16;
+    let mut current = bc as *mut Bytecode;
+
+    while current != target_bc {
+        level += 1;
+        current = unsafe { (*current).parent_ptr }
+            .expect("target bytecode must be in the parent chain");
+    }
+
+    level
 }
 fn jv_number(n: f64) -> Jv {
     Jv::number(n)
@@ -1061,8 +1088,8 @@ fn bind_matcher_local(mut matcher: Block, mut body: Block) -> Block {
 }
 
 /// Get unbound variables from a block (local version using Block type)
-fn block_get_unbound_vars_local(_b: &Block, _vars: &mut Jv) {
-    // Stub implementation - iterate through block and collect unbound variable names
+fn block_get_unbound_vars_local(b: &Block, vars: &mut Jv) {
+    block_get_unbound_vars(b, vars);
 }
 
 pub const UNKNOWN_LOCATION: Location = Location { start: -1, end: -1 };
@@ -1108,7 +1135,8 @@ fn get_opcode_flags_u16(op: Opcode) -> i32 {
         TRY_BEGIN => OP_HAS_BRANCH,
         FORK => OP_HAS_BRANCH,
         DESTRUCTURE_ALT => OP_HAS_BRANCH,
-        LOADV | LOADVN | STOREV | STOREVN => OP_HAS_BINDING | OP_HAS_VARIABLE,
+        LOADV | LOADVN | STOREV | STOREVN | RANGE => OP_HAS_BINDING | OP_HAS_VARIABLE,
+        STORE_GLOBAL => OP_HAS_CONSTANT | OP_HAS_VARIABLE | OP_HAS_BINDING | OP_IS_CALL_PSEUDO,
         APPEND => OP_HAS_BINDING,
         CALL_JQ => OP_HAS_UFUNC | OP_HAS_BINDING | OP_IS_CALL_PSEUDO,
         _ => 0,
@@ -1455,7 +1483,7 @@ fn make_env(env: Jv) -> Jv {
     r
 }
 /// Expand call argument list
-pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
+pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv, lf: &mut Locfile) -> i32 {
     let debug = std::env::var("DEBUG_COMPILE").is_ok();
     let mut errors = 0;
     let mut ret = gen_noop();
@@ -1483,12 +1511,22 @@ pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
                         if sym_bytes.len() == 2 && sym_bytes[0] == b'*'
                             && sym_bytes[1] >= b'1' && sym_bytes[1] <= b'3'
                         {
+                            record_compile_error(
+                                lf,
+                                &curr.source,
+                                "break used outside labeled control structure",
+                            );
                             locfile_locate(
                                 &curr.locfile,
                                 &curr.source,
                                 "jq: error: break used outside labeled control structure",
                             );
                         } else {
+                            record_compile_error(
+                                lf,
+                                &curr.source,
+                                &format!("${} is not defined", sym),
+                            );
                             locfile_locate(
                                 &curr.locfile,
                                 &curr.source,
@@ -1503,12 +1541,22 @@ pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
             } else if curr.bound_by.is_none() {
                 if let Some(ref sym) = curr.symbol {
                     if debug { eprintln!("  ERROR: {}/{} is not defined (op={})", sym, curr.nactuals, curr.op); }
+                    record_compile_error(
+                        lf,
+                        &curr.source,
+                        &format!("{}/{} is not defined", sym, curr.nactuals),
+                    );
                     // Always print error even if locfile is None
                     eprintln!("jq: error: {}/{} is not defined", sym, curr.nactuals);
                 } else {
                     // No symbol - report the opcode so we can debug
                     let op_name = opcode_describe(curr.op).name;
                     if debug { eprintln!("  ERROR: unbound {} instruction (op={})", op_name, curr.op); }
+                    record_compile_error(
+                        lf,
+                        &curr.source,
+                        &format!("unbound {} instruction", op_name),
+                    );
                     // Always print error even if locfile is None
                     eprintln!("jq: error: unbound {} instruction", op_name);
                 }
@@ -1575,7 +1623,7 @@ pub fn expand_call_arglist(b: &mut Block, args: Jv, env: &mut Jv) -> i32 {
                         let mut body = std::mem::take(&mut i.subfn);
                         i.subfn = gen_noop();
                         inst_free(i_box);
-                        errors += expand_call_arglist(&mut body, args.clone(), env);
+                        errors += expand_call_arglist(&mut body, args.clone(), env, lf);
                         prelude = block_join(gen_subexp(body), prelude);
                         actual_args += 1;
                     }
@@ -1623,9 +1671,10 @@ pub fn block_bind_referenced(
 /// Generate define-or operation
 pub fn gen_definedor(a: Block, b: Block) -> Block {
     let found_var = gen_op_var_fresh(STOREV, "found");
+    let found_var_ptr = found_var.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
     let init = block_join(
         block_join(gen_op_simple(DUP), gen_const(Jv::jv_false())),
-        found_var.clone(),
+        found_var,
     );
     let backtrack = gen_op_simple(BACKTRACK);
     let tail = block_join(
@@ -1634,11 +1683,11 @@ pub fn gen_definedor(a: Block, b: Block) -> Block {
                 block_join(
                     block_join(
                         gen_op_simple(DUP),
-                        gen_op_bound(LOADV, &found_var),
+                        gen_op_bound_to_ptr(LOADV, found_var_ptr),
                     ),
                     gen_op_target(JUMP_F, &backtrack),
                 ),
-                backtrack.clone(),
+                backtrack,
             ),
             gen_op_simple(POP),
         ),
@@ -1648,7 +1697,7 @@ pub fn gen_definedor(a: Block, b: Block) -> Block {
     let if_found = block_join(
         block_join(
             block_join(gen_op_simple(DUP), gen_const(Jv::jv_true())),
-            gen_op_bound(STOREV, &found_var),
+            gen_op_bound_to_ptr(STOREV, found_var_ptr),
         ),
         gen_op_target(JUMP, &tail),
     );
@@ -1815,15 +1864,27 @@ pub fn block_bind_subblock_inner(
     let mut current = body.first.as_mut();
     while let Some(inst) = current {
         if inst.any_unbound == 0 {
+            nrefs += block_bind_subblock_inner(
+                &mut inst.any_unbound,
+                binder,
+                &mut inst.subfn,
+                bindflags,
+                break_distance,
+            );
+            nrefs += block_bind_subblock_inner(
+                &mut inst.any_unbound,
+                binder,
+                &mut inst.arglist,
+                bindflags,
+                break_distance,
+            );
+            if inst.any_unbound != 0 {
+                *any_unbound = 1;
+            }
             current = inst.next.as_mut();
             continue;
         }
         let flags = get_opcode_flags_u16(inst.op);
-        let debug_bind = std::env::var("DEBUG_BIND").is_ok();
-        if debug_bind && inst.symbol.as_ref().map_or(false, |s| s == "f") {
-            eprintln!("  bind_subblock_inner: inst op={} sym={:?} bound={:?} nact={} vs binder={:?} nformal={}",
-                inst.op, inst.symbol, inst.bound_by.is_some(), inst.nactuals, binder_symbol, binder_nformals);
-        }
         if (flags & bindflags) == (bindflags & !OP_BIND_WILDCARD)
             && inst.bound_by.is_none() && inst.symbol.is_some()
         {
@@ -1833,13 +1894,7 @@ pub fn block_bind_subblock_inner(
                     && break_distance <= 3 && inst_symbol.len() == 2
                     && inst_symbol.chars().nth(1)
                         == Some((b'1' + break_distance as u8) as char));
-            if debug_bind && inst_symbol == "f" {
-                eprintln!("    matches={} arity_ok={}", matches, inst.nactuals == -1 || inst.nactuals == binder_nformals);
-            }
             if matches && (inst.nactuals == -1 || inst.nactuals == binder_nformals) {
-                if debug_bind && inst_symbol == "f" {
-                    eprintln!("    BINDING f to {:?}", binder_ptr);
-                }
                 inst.bound_by = Some(binder_ptr);
                 nrefs += 1;
             }
@@ -1892,6 +1947,20 @@ fn block_bind_to_binder_ptr(
     let mut current = body.first.as_mut();
     while let Some(inst) = current {
         if inst.any_unbound == 0 {
+            nrefs += block_bind_to_binder_ptr(
+                &mut inst.subfn,
+                binder_ptr,
+                binder_symbol,
+                binder_nformals,
+                bindflags,
+            );
+            nrefs += block_bind_to_binder_ptr(
+                &mut inst.arglist,
+                binder_ptr,
+                binder_symbol,
+                binder_nformals,
+                bindflags,
+            );
             current = inst.next.as_mut();
             continue;
         }
@@ -2026,8 +2095,8 @@ pub fn block_count_actuals(b: &Block) -> i32 {
 /// Opcode flags for binding (must match C's bytecode.h: OP_BIND_WILDCARD = 2048)
 const OP_BIND_WILDCARD: i32 = 2048;
 /// Helper function to set object key
-pub fn jv_object_set(mut obj: Jv, key: Jv, value: Jv) -> Jv {
-    obj
+pub fn jv_object_set(obj: Jv, key: Jv, value: Jv) -> Jv {
+    crate::jv::jv_object_set(obj, key, value)
 }
 /// Memory allocation placeholder
 pub fn jv_mem_alloc<T: Default>() -> Box<T> {
@@ -2238,7 +2307,7 @@ pub fn gen_destructure_alt(mut matcher: Block) -> Block {
         }
     }
     let mut inst = inst_new(DESTRUCTURE_ALT);
-    inst.subfn = Block::default();
+    inst.subfn = matcher;
     inst_block(inst)
 }
 /// Compile a block into bytecode
@@ -2259,7 +2328,7 @@ pub fn compile(
     let mut var_frame_idx = 0i32;
     bc.nsubfunctions = 0;
     if let Some(ref mut env_jv) = env {
-        errors += expand_call_arglist(&mut b, args.clone(), env_jv);
+        errors += expand_call_arglist(&mut b, args.clone(), env_jv, lf);
     }
     b = block_join(b, gen_op_simple(RET));
     let mut localnames = Jv::array();
@@ -2296,7 +2365,11 @@ pub fn compile(
             if (op_flags & OP_HAS_VARIABLE) != 0 {
                 if let Some(bound_ptr) = curr.bound_by {
                     if bound_ptr == ptr {
-                        curr.imm = InstImmediate::IntVal(var_frame_idx);
+                        if curr.op == STORE_GLOBAL {
+                            curr.nformals = var_frame_idx;
+                        } else {
+                            curr.imm = InstImmediate::IntVal(var_frame_idx);
+                        }
                         var_frame_idx += 1;
                         if let Some(ref sym) = curr.symbol {
                             localnames = localnames.array_append(Jv::string(sym));
@@ -2358,10 +2431,12 @@ pub fn compile(
                 let curr = &mut *ptr;
                 if curr.op == CLOSURE_CREATE {
                     if let InstImmediate::IntVal(idx) = curr.imm {
+                        let parent_ptr = bc as *mut Bytecode;
                         let subfn = &mut bc.subfunctions[idx as usize];
                         subfn.globals = bc.globals.clone();
                         // Note: parent cannot be a Box pointing back to bc (ownership cycle)
                         subfn.parent = None;
+                        subfn.parent_ptr = Some(parent_ptr);
                         subfn.nclosures = 0;
                         subfn.debuginfo = if let Some(ref sym) = curr.symbol {
                             Jv::object()
@@ -2531,7 +2606,14 @@ pub fn compile(
                         let level = nesting_level(bc, bound_ptr);
                         code[pos as usize] = level as u16;
                         pos += 1;
-                        if let InstImmediate::IntVal(intval) = (*bound_ptr).imm {
+                        let intval = if (*bound_ptr).op == STORE_GLOBAL {
+                            Some((*bound_ptr).nformals)
+                        } else if let InstImmediate::IntVal(intval) = (*bound_ptr).imm {
+                            Some(intval)
+                        } else {
+                            None
+                        };
+                        if let Some(intval) = intval {
                             let var = intval as u16;
                             code[pos as usize] = var;
                             pos += 1;
@@ -2562,7 +2644,14 @@ pub fn compile(
                         let level = nesting_level(bc, bound_ptr);
                         code[pos as usize] = level as u16;
                         pos += 1;
-                        if let InstImmediate::IntVal(intval) = (*bound_ptr).imm {
+                        let intval = if (*bound_ptr).op == STORE_GLOBAL {
+                            Some((*bound_ptr).nformals)
+                        } else if let InstImmediate::IntVal(intval) = (*bound_ptr).imm {
+                            Some(intval)
+                        } else {
+                            None
+                        };
+                        if let Some(intval) = intval {
                             let var = intval as u16;
                             code[pos as usize] = var;
                             pos += 1;
@@ -2800,8 +2889,9 @@ pub fn gen_foreach(
 ) -> Block {
     // Create variables for multiple references
     let state_var = gen_op_var_fresh(STOREV, "foreach");
-    let state_var_ref1 = gen_op_unbound(LOADVN, "foreach");
-    let state_var_ref2 = gen_op_unbound(STOREV, "foreach");
+    let state_var_ptr = state_var.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
+    let state_var_ref1 = gen_op_bound_to_ptr(LOADVN, state_var_ptr);
+    let state_var_ref2 = gen_op_bound_to_ptr(STOREV, state_var_ptr);
     let output = gen_op_targetlater(JUMP);
     // Save pointer to output instruction BEFORE joining it (matches gen_both pattern)
     let output_ptr = output.first.as_ref().map(|b| b.as_ref() as *const Inst as *mut Inst);
@@ -3004,14 +3094,15 @@ pub fn block_bind_library(
     while let Some(curr_ptr) = current {
         let curr = unsafe { &mut *curr_ptr };
         let mut bindflags2 = bindflags;
-        let has_var_or_const = false;
+        let curr_flags = get_opcode_flags_u16(curr.op);
+        let has_var_or_const = (curr_flags & (OP_HAS_VARIABLE | OP_HAS_CONSTANT)) != 0;
         if has_var_or_const {
             bindflags2 = OP_HAS_VARIABLE | OP_HAS_BINDING;
         }
         let original_symbol = curr.symbol.clone();
         if let Some(ref sym) = original_symbol {
             let temp_name = format!("{}{}", matchname, sym);
-            curr.symbol = Some(temp_name);
+            curr.symbol = Some(temp_name.clone());
             // Create a temporary block wrapper for the current instruction
             let mut inst_blk = Block {
                 first: None,  // We don't own this instruction
@@ -3023,7 +3114,7 @@ pub fn block_bind_library(
         }
         current = curr.prev;
     }
-    result_body
+    block_join(binder, result_body)
 }
 /// Mark all referenced instructions in a block
 pub fn block_mark_referenced(body: Block) {

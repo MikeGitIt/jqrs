@@ -635,12 +635,7 @@ pub fn jv_get_kind(v: &Jv) -> JvKind {
 }
 /// Helper function to get the numeric value from a jv
 fn jv_number_value(v: &Jv) -> f64 {
-    // Interpret u field as f64 bits when kind is Number
-    if jv_get_kind(v) == JvKind::Number {
-        f64::from_bits(v.u)
-    } else {
-        0.0
-    }
+    crate::jv::jv_number_value(v)
 }
 /// Create a number Jv
 pub fn jv_number(val: f64) -> Jv {
@@ -674,13 +669,7 @@ pub fn jv_null() -> Jv {
     Jv::null()
 }
 fn jv_invalid_with_msg(msg: Jv) -> Jv {
-    Jv {
-        kind_flags: JvKind::Invalid as u8,
-        pad_: 0,
-        offset: 0,
-        size: msg.size,
-        u: msg.u,
-    }
+    crate::jv::jv_invalid_with_msg(msg)
 }
 /// Get array length - takes reference
 pub fn jv_array_length(v: &Jv) -> i32 {
@@ -712,7 +701,8 @@ pub fn type_error(input: Jv, msg: &str) -> Jv {
         JvKind::Object => "object",
         JvKind::Invalid => "invalid",
     };
-    let error_msg = format!("{} ({:?}) {}", kind_str, input, msg);
+    let detail = crate::jv_print::jv_dump_string_trunc(jv_copy(&input), 15);
+    let error_msg = format!("{} ({}) {}", kind_str, detail, msg);
     jv_free(input);
     jv_invalid_with_msg(jv_string(&error_msg))
 }
@@ -736,9 +726,14 @@ pub fn type_error2(a: Jv, b: Jv, msg: &str) -> Jv {
         JvKind::Object => "object",
         JvKind::Invalid => "invalid",
     };
+    let detail_a = crate::jv_print::jv_dump_string_trunc(jv_copy(&a), 15);
+    let detail_b = crate::jv_print::jv_dump_string_trunc(jv_copy(&b), 15);
     jv_free(a);
     jv_free(b);
-    jv_invalid_with_msg(jv_string(&format!("{} and {} {}", kind_a, kind_b, msg)))
+    jv_invalid_with_msg(jv_string(&format!(
+        "{} ({}) and {} ({}) {}",
+        kind_a, detail_a, kind_b, detail_b, msg
+    )))
 }
 /// Return an error with a single value
 pub fn ret_error(a: Jv, err: Jv) -> Jv {
@@ -756,12 +751,12 @@ pub fn ret_error2(bad1: Jv, bad2: Jv, msg: Jv) -> Jv {
 /// Convert tm struct to jv array
 pub fn tm2jv(tm: &Tm) -> Jv {
     let mut arr = Jv::array();
-    arr = jv_array_append(arr, jv_number(tm.tm_sec as f64));
-    arr = jv_array_append(arr, jv_number(tm.tm_min as f64));
-    arr = jv_array_append(arr, jv_number(tm.tm_hour as f64));
-    arr = jv_array_append(arr, jv_number(tm.tm_mday as f64));
+    arr = jv_array_append(arr, jv_number((tm.tm_year + 1900) as f64));
     arr = jv_array_append(arr, jv_number(tm.tm_mon as f64));
-    arr = jv_array_append(arr, jv_number(tm.tm_year as f64));
+    arr = jv_array_append(arr, jv_number(tm.tm_mday as f64));
+    arr = jv_array_append(arr, jv_number(tm.tm_hour as f64));
+    arr = jv_array_append(arr, jv_number(tm.tm_min as f64));
+    arr = jv_array_append(arr, jv_number(tm.tm_sec as f64));
     arr = jv_array_append(arr, jv_number(tm.tm_wday as f64));
     arr = jv_array_append(arr, jv_number(tm.tm_yday as f64));
     arr
@@ -771,38 +766,29 @@ fn jv2tm(a: &Jv, tm: &mut Tm) -> bool {
     if jv_get_kind(a) != JvKind::Array {
         return false;
     }
-    if jv_array_length(a) < 6 {
-        return false;
-    }
-    let sec = jv_array_get(a, 0);
-    let min = jv_array_get(a, 1);
-    let hour = jv_array_get(a, 2);
-    let mday = jv_array_get(a, 3);
-    let mon = jv_array_get(a, 4);
-    let year = jv_array_get(a, 5);
-    if jv_get_kind(&sec) != JvKind::Number || jv_get_kind(&min) != JvKind::Number
-        || jv_get_kind(&hour) != JvKind::Number || jv_get_kind(&mday) != JvKind::Number
-        || jv_get_kind(&mon) != JvKind::Number || jv_get_kind(&year) != JvKind::Number
-    {
-        return false;
-    }
-    tm.tm_sec = jv_number_value(&sec) as i32;
-    tm.tm_min = jv_number_value(&min) as i32;
-    tm.tm_hour = jv_number_value(&hour) as i32;
-    tm.tm_mday = jv_number_value(&mday) as i32;
-    tm.tm_mon = jv_number_value(&mon) as i32;
-    tm.tm_year = jv_number_value(&year) as i32;
-    if jv_array_length(a) > 6 {
-        let wday = jv_array_get(a, 6);
-        if jv_get_kind(&wday) == JvKind::Number {
-            tm.tm_wday = jv_number_value(&wday) as i32;
+    let len = jv_array_length(a);
+    for i in 0..len.min(8) {
+        let n = jv_array_get(a, i);
+        if jv_get_kind(&n) != JvKind::Number || jvp_number_is_nan(&n) {
+            jv_free(n);
+            return false;
         }
-    }
-    if jv_array_length(a) > 7 {
-        let yday = jv_array_get(a, 7);
-        if jv_get_kind(&yday) == JvKind::Number {
-            tm.tm_yday = jv_number_value(&yday) as i32;
+        let mut value = jv_number_value(&n) as i32;
+        if i == 0 {
+            value -= 1900;
         }
+        match i {
+            0 => tm.tm_year = value,
+            1 => tm.tm_mon = value,
+            2 => tm.tm_mday = value,
+            3 => tm.tm_hour = value,
+            4 => tm.tm_min = value,
+            5 => tm.tm_sec = value,
+            6 => tm.tm_wday = value,
+            7 => tm.tm_yday = value,
+            _ => {}
+        }
+        jv_free(n);
     }
     true
 }
@@ -1396,13 +1382,7 @@ pub fn jv_false() -> Jv {
     jv_bool(false)
 }
 fn jv_array() -> Jv {
-    Jv {
-        kind_flags: JvKind::Array as u8,
-        pad_: 0,
-        offset: 0,
-        size: 0,
-        u: 0,
-    }
+    crate::jv::jv_array()
 }
 /// Get the name of a jv kind
 fn jv_kind_name(kind: JvKind) -> &'static str {
@@ -1524,17 +1504,16 @@ const CMP_OP_LESSEQ: CmpOp = CmpOp::LessEq;
 const CMP_OP_GREATEREQ: CmpOp = CmpOp::GreaterEq;
 /// Get string length in bytes
 pub fn jv_string_length_bytes(v: Jv) -> usize {
-    // String length is stored in size field
-    let len = if jv_get_kind(&v) == JvKind::String { v.size as usize } else { 0 };
+    let len = if jv_get_kind(&v) == JvKind::String {
+        crate::jv::jv_string_length_bytes(&v) as usize
+    } else {
+        0
+    };
     jv_free(v);
     len
 }
 fn jv_number_with_literal(s: &str) -> Jv {
-    // Parse the string as a number
-    match s.parse::<f64>() {
-        Ok(n) => jv_number(n),
-        Err(_) => jv_null(),
-    }
+    crate::jv::jv_number_with_literal(s)
 }
 fn jv_parse_sized(s: &str, len: i32) -> Jv {
     crate::jv_parse::jv_parse_sized(s, len)
@@ -2259,7 +2238,7 @@ pub fn f_significand<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
 }
 /// Bind bytecoded builtins (empty, not, path) - matches C's bind_bytecoded_builtins
 fn bind_bytecoded_builtins(b: Block) -> Block {
-    use crate::compile::{gen_noop, gen_op_simple, gen_function, gen_param, gen_call, gen_condbranch, gen_const, CompileOpcode};
+    use crate::compile::{gen_noop, gen_op_simple, gen_function, gen_param, gen_call, gen_condbranch, gen_const, gen_op_var_fresh, gen_op_bound, CompileOpcode, LOADV, RANGE, STOREV};
     use crate::jv::{jv_true, jv_false};
     use crate::parser::block_join;
 
@@ -2283,7 +2262,32 @@ fn bind_bytecoded_builtins(b: Block) -> Block {
     );
     builtins = block_join(builtins, gen_function("path", gen_param("arg"), path_body));
 
-    // range is defined in JQ_BUILTINS as jq code
+    // range(start; end) is bytecoded so it can use the RANGE opcode.
+    let rangevar = gen_op_var_fresh(STOREV, "rangevar");
+    let rangestart = gen_op_var_fresh(STOREV, "rangestart");
+    let load_start = gen_op_bound(LOADV, &rangestart);
+    let range_next = gen_op_bound(RANGE, &rangevar);
+    let range_body = block_join(
+        block_join(
+            block_join(
+                block_join(
+                    block_join(
+                        block_join(
+                            block_join(gen_op_simple(CompileOpcode::DUP as u16), gen_call("start", gen_noop())),
+                            rangestart,
+                        ),
+                        gen_call("end", gen_noop()),
+                    ),
+                    gen_op_simple(CompileOpcode::DUP as u16),
+                ),
+                load_start,
+            ),
+            rangevar,
+        ),
+        range_next,
+    );
+    let range_params = block_join(gen_param("start"), gen_param("end"));
+    builtins = block_join(builtins, gen_function("range", range_params, range_body));
 
     block_join(builtins, b)
 }
@@ -2384,9 +2388,9 @@ pub fn builtins_bind<T>(_jq: &mut JqState<T>, bb: Block) -> Block {
         Cfunction { fptr: None, name: Some("exp10".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("exp2".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("expm1".to_string()), nargs: 1 },
-        Cfunction { fptr: None, name: Some("pow".to_string()), nargs: 2 },
-        Cfunction { fptr: None, name: Some("atan2".to_string()), nargs: 2 },
-        Cfunction { fptr: None, name: Some("fma".to_string()), nargs: 3 },
+        Cfunction { fptr: None, name: Some("pow".to_string()), nargs: 3 },
+        Cfunction { fptr: None, name: Some("atan2".to_string()), nargs: 3 },
+        Cfunction { fptr: None, name: Some("fma".to_string()), nargs: 4 },
 
         // Error and control
         Cfunction { fptr: None, name: Some("error".to_string()), nargs: 1 },
@@ -2402,6 +2406,8 @@ pub fn builtins_bind<T>(_jq: &mut JqState<T>, bb: Block) -> Block {
         Cfunction { fptr: None, name: Some("input".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("input_filename".to_string()), nargs: 1 },
         Cfunction { fptr: None, name: Some("input_line_number".to_string()), nargs: 1 },
+        Cfunction { fptr: None, name: Some("have_decnum".to_string()), nargs: 1 },
+        Cfunction { fptr: None, name: Some("have_literal_numbers".to_string()), nargs: 1 },
 
         // Date/time functions
         Cfunction { fptr: None, name: Some("strptime".to_string()), nargs: 2 },
@@ -2589,19 +2595,16 @@ fn block_list_funcs(_builtins: &Block, _include_private: i32) -> Jv {
 pub fn gen_builtin_list(builtins: Block) -> Block {
     use crate::compile::{gen_noop, gen_function, gen_const};
     use crate::parser::block_join;
-    let list = block_list_funcs(&builtins, 1).array_append(Jv::string("builtins/0"));
+    let list = crate::compile::block_list_funcs(builtins.clone(), 1)
+        .array_append(Jv::string("builtins/0"));
     block_join(builtins, gen_function("builtins", gen_noop(), gen_const(list)))
-}
-/// Load module metadata (placeholder)
-fn load_module_meta<T>(_jq: &mut JqState<T>, _name: Jv) -> Jv {
-    Jv::null()
 }
 /// Get module metadata
 pub fn f_modulemeta<T>(jq: &mut JqState<T>, a: Jv) -> Jv {
     if a.get_kind() != JvKind::String {
         return ret_error(a, Jv::string("modulemeta input module name must be a string"));
     }
-    load_module_meta(jq, a)
+    crate::linker::load_module_meta(jq, a)
 }
 /// Truncate a number
 pub fn f_trunc<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
@@ -2717,8 +2720,8 @@ pub fn f_input<T>(jq: &mut JqState<T>, input: Jv) -> Jv {
 /// Escapes special characters in a string based on escape mappings
 pub fn escape_string(input: Jv, escapings: &str) -> Jv {
     assert!(jv_get_kind(& input) == JvKind::String);
-    let mut lookup: HashMap<char, &str> = HashMap::new();
-    lookup.insert('\0', "\\0");
+    let mut lookup: HashMap<char, String> = HashMap::new();
+    lookup.insert('\0', "\\0".to_string());
     let mut chars = escapings.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\0' {
@@ -2732,6 +2735,7 @@ pub fn escape_string(input: Jv, escapings: &str) -> Jv {
             }
             replacement.push(chars.next().unwrap());
         }
+        lookup.insert(ch, replacement);
     }
     let mut ret = String::new();
     let s = jv_string_value(&input);
@@ -2857,7 +2861,7 @@ pub fn f_tostring<T>(_jq: &mut JqState<T>, input: Jv) -> Jv {
     }
 }
 /// Formats input according to the specified format string
-pub fn f_format(jq: &mut JqState, input: Jv, fmt: Jv) -> Jv {
+pub fn f_format<T>(jq: &mut JqState<T>, input: Jv, fmt: Jv) -> Jv {
     if jv_get_kind(&fmt) != JvKind::String {
         jv_free(input);
         return type_error(fmt, "is not a valid format");
@@ -3073,7 +3077,7 @@ pub fn f_format(jq: &mut JqState, input: Jv, fmt: Jv) -> Jv {
     }
 }
 /// Returns the maximum element by comparison key
-pub fn f_max_by_impl(_jq: &mut JqState, x: Jv, y: Jv) -> Jv {
+pub fn f_max_by_impl<T>(_jq: &mut JqState<T>, x: Jv, y: Jv) -> Jv {
     minmax_by(x, y, 0)
 }
 /// Binary plus operation - handles null, number, string, array, and object addition
@@ -3566,9 +3570,7 @@ pub fn jv_equal(a: Jv, b: Jv) -> bool {
         JvKind::False => true,
         JvKind::Number => {
             // C: jvp_number_equal
-            let va = jv_number_value(&a);
-            let vb = jv_number_value(&b);
-            (va - vb).abs() < f64::EPSILON
+            crate::jv::jvp_number_equal(&a, &b) != 0
         }
         JvKind::String => {
             // C: jvp_string_equal

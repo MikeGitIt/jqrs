@@ -24,7 +24,7 @@
 use std::cmp::Ordering;
 use crate::jv::{
     jv_bool, jv_false, jv_object, jv_object_delete, jv_object_set, Jv, JvKind,
-    jvp_number_cmp,
+    jv_object_has_key, jvp_number_cmp,
 };
 // Note: Most jv_* functions are defined locally as stubs in this file
 // Note: jv_cmp, jv_group, jv_has, jv_keys_unsorted, jv_set, jv_getpath are defined in this file
@@ -711,9 +711,9 @@ pub fn jv_has(t: Jv, k: Jv) -> Jv {
         return jv_false();
     }
     if kind_t == JvKind::Object && kind_k == JvKind::String {
-        let elem = jv_object_get(t, k);
-        let ret = jv_bool(jv_is_valid(&elem));
-        jv_free(elem);
+        let ret = jv_bool(jv_object_has_key(&t, &k));
+        jv_free(t);
+        jv_free(k);
         return ret;
     }
     if kind_t == JvKind::Array && kind_k == JvKind::Number {
@@ -1045,7 +1045,7 @@ fn jv_string_slice(s: Jv, start: i32, end: i32) -> Jv {
     crate::jv::jv_string_slice(s, start, end)
 }
 fn jv_number_value(n: &Jv) -> f64 {
-    f64::from_bits(n.u)
+    crate::jv::jv_number_value(n)
 }
 fn jvp_number_is_nan(n: &Jv) -> bool {
     jv_number_value(n).is_nan()

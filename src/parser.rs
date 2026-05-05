@@ -36,7 +36,7 @@ use crate::builtin::{
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::locfile::{locfile_locate, locfile_retain};
-use crate::lexer::{jq_yylex, jq_yylex_init_extra, jq_yy_scan_bytes, jq_yy_delete_buffer, jq_yylex_destroy};
+use crate::lexer::{jq_yylex, jq_yylex_init_extra, jq_yy_scan_bytes, jq_yy_delete_buffer, jq_yylex_destroy, LITERAL, QQSTRING_TEXT};
 use crate::bytecode::Opcode;
 use crate::jv::{
     Jv, JvKind, jv_invalid_get_msg, jv_get_kind, jv_string_value,
@@ -49,7 +49,7 @@ use crate::types::{Locfile, LexerParam, YY_BUFFER_STATE};
 // Block and Inst are re-exported from compile.rs via types.rs
 /// Check if a jv value is valid
 pub fn jv_is_valid(x: &crate::jv::Jv) -> bool {
-    x.kind_flags != 0
+    x.get_kind() != JvKind::Invalid
 }
 pub fn jv_copy(jv: &Jv) -> Jv {
     jv.clone()
@@ -925,8 +925,8 @@ pub fn gen_slice_index(obj: Block, start: Block, end: Block, idx_op: OpCode) -> 
     let key4 = block_join(key3, gen_subexp(gen_const(jv_string("end"))));
     let key5 = block_join(key4, gen_subexp(end));
     let key = block_join(key5, gen_op_simple(OpCode::Insert));
-    // C: return BLOCK(gen_subexp(key), obj, gen_op_simple(idx_op));
-    let result1 = block_join(gen_subexp(key), obj);
+    // C: return BLOCK(key, obj, gen_op_simple(idx_op));
+    let result1 = block_join(key, obj);
     block_join(result1, gen_op_simple(idx_op))
 }
 pub fn gen_update(object: Block, val: Block, optype: i32) -> Block {
@@ -1245,16 +1245,21 @@ pub fn yyerror<T>(
     s: &str,
 ) {
     *errors += 1;
-    if s.contains("unexpected") {
-        locfile_locate(
-            locations,
-            *loc,
-            &format!("jq: error: {} (Unix shell quoting issues?)", s),
-            &[], // Empty args slice
-        );
+    let formatted = if s.contains("unexpected") {
+        format!("jq: error: {} (Unix shell quoting issues?)", s)
     } else {
-        locfile_locate(locations, *loc, &format!("jq: error: {}", s), &[]);
+        format!("jq: error: {}", s)
+    };
+    if locations.error.is_none() {
+        let first_line = if loc.start == -1 {
+            format!("{}\n<unknown location>", formatted)
+        } else {
+            let startline = locations.locfile_get_line(loc.start);
+            format!("{} at {}, line {}:", formatted, locations.fname, startline + 1)
+        };
+        locations.error = Some(first_line);
     }
+    locfile_locate(locations, *loc, &formatted, &[]);
 }
 /// Destroy a semantic value
 ///
@@ -1328,20 +1333,42 @@ pub fn yydestruct<T>(
 pub fn yylex<T>(
     yylval: &mut YYSType,
     yylloc: &mut Location,
-    _answer: &mut Block,
-    _errors: &mut i32,
-    _locations: &mut Locfile<T>,
+    answer: &mut Block,
+    errors: &mut i32,
+    locations: &mut Locfile<T>,
     lexer_param_ptr: &mut LexerParam,
 ) -> i32 {
     // Get the scanner from LexerParam and call jq_yylex
-    match lexer_param_ptr.scanner {
+    let tok = match lexer_param_ptr.scanner {
         Some(scanner_ptr) => {
             // SAFETY: The scanner pointer is valid for the duration of parsing
             let scanner = unsafe { &mut *scanner_ptr };
             jq_yylex(yylval, yylloc, scanner)
         }
         None => 0, // EOF if no scanner
+    };
+
+    if (tok == LITERAL || tok == QQSTRING_TEXT) {
+        let mut literal_error = None;
+        if let YYSType::Literal(literal) = yylval {
+            if !crate::jv::jv_is_valid(literal) {
+                let msg = jv_invalid_get_msg(jv_copy(literal));
+                literal_error = if jv_get_kind(&msg) == JvKind::String {
+                    Some(jv_string_value(&msg).to_string())
+                } else {
+                    Some("Invalid literal".to_string())
+                };
+                jv_free(msg);
+                let old = std::mem::replace(literal, jv_null());
+                jv_free(old);
+            }
+        }
+        if let Some(msg) = literal_error {
+            yyerror(yylloc, answer, errors, locations, lexer_param_ptr, &msg);
+        }
     }
+
+    tok
 }
 /// Memory allocation for parser
 pub fn jv_mem_alloc(size: usize) -> Vec<u8> {
@@ -1655,7 +1682,7 @@ pub fn yyparse<T>(
                 if debug_parser {
                     eprintln!("RULE 2: top_block.first.is_some()={}", top_block.first.is_some());
                 }
-                let joined = block_join(top_block, exp);
+                let joined = block_join(block_join(block_join(module, imports), top_block), exp);
                 if debug_parser {
                     eprintln!("RULE 2: after join TOP+exp, joined.first.is_some()={}, joined.last.is_some()={}",
                              joined.first.is_some(), joined.last.is_some());
@@ -2000,8 +2027,24 @@ pub fn yyparse<T>(
             // case 53: ImportFrom: String
             53 => {
                 let string = yyvs[yyvsp].take_blk();
-                if !block_is_const(&string) {
-                    yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Import path must be constant");
+                let is_const = block_is_const(&string);
+                let const_kind = if is_const {
+                    block_const_kind(&string)
+                } else {
+                    JvKind::Invalid
+                };
+                if !is_const || const_kind != JvKind::String {
+                    if is_const && const_kind == JvKind::Invalid {
+                        let msg = jv_invalid_get_msg(block_const(&string));
+                        if jv_get_kind(&msg) == JvKind::String {
+                            yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, jv_string_value(&msg));
+                        } else {
+                            yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Import path must be constant");
+                        }
+                        jv_free(msg);
+                    } else {
+                        yyerror(&yyloc, answer, errors, locations, lexer_param_ptr, "Import path must be constant");
+                    }
                     yyval = YYSType::Blk(gen_const(jv_string("")));
                     block_free(string);
                 } else {
@@ -2434,12 +2477,12 @@ pub fn yyparse<T>(
             // case 124: Pattern: '[' ArrayPats ']'
             124 => {
                 let arr_pats = yyvs[yyvsp - 1].take_blk();
-                yyval = YYSType::Blk(arr_pats);
+                yyval = YYSType::Blk(block_join(arr_pats, gen_op_simple(OpCode::Pop)));
             }
             // case 125: Pattern: '{' ObjPats '}'
             125 => {
                 let obj_pats = yyvs[yyvsp - 1].take_blk();
-                yyval = YYSType::Blk(obj_pats);
+                yyval = YYSType::Blk(block_join(obj_pats, gen_op_simple(OpCode::Pop)));
             }
             // case 126: ArrayPats: Pattern
             126 => {
@@ -2478,7 +2521,11 @@ pub fn yyparse<T>(
                 let pat = yyvs[yyvsp].take_blk();
                 let name = jv_string_value(&binding);
                 let field_name = if name.starts_with('$') { &name[1..] } else { name };
-                yyval = YYSType::Blk(gen_object_matcher(gen_const(jv_string(field_name)), pat));
+                let capture = block_join(
+                    block_join(gen_op_simple(OpCode::Dup), gen_op_unbound(OpCode::StoreV, name)),
+                    pat,
+                );
+                yyval = YYSType::Blk(gen_object_matcher(gen_const(jv_string(field_name)), capture));
                 jv_free(binding);
             }
             // case 132: ObjPat: IDENT ':' Pattern
@@ -2514,9 +2561,28 @@ pub fn yyparse<T>(
             // Keyword: "as" | "def" | "module" | "import" | "include" | "if" | "then" | "else" | "elif"
             //        | "reduce" | "foreach" | "end" | "and" | "or" | "try" | "catch" | "label" | "break"
             137..=154 => {
-                // All keywords just produce their literal value
-                let keyword = yyvs[yyvsp].literal().cloned().unwrap_or_else(Jv::null);
-                yyval = YYSType::Literal(keyword);
+                let keyword = match yyn {
+                    137 => "as",
+                    138 => "def",
+                    139 => "module",
+                    140 => "import",
+                    141 => "include",
+                    142 => "if",
+                    143 => "then",
+                    144 => "else",
+                    145 => "elif",
+                    146 => "reduce",
+                    147 => "foreach",
+                    148 => "end",
+                    149 => "and",
+                    150 => "or",
+                    151 => "try",
+                    152 => "catch",
+                    153 => "label",
+                    154 => "break",
+                    _ => unreachable!(),
+                };
+                yyval = YYSType::Literal(jv_string(keyword));
             }
             // case 155: MkDict: %empty
             155 => {
@@ -2603,6 +2669,18 @@ pub fn yyparse<T>(
             168 => {
                 let key = yyvs[yyvsp - 3].take_blk();
                 let val = yyvs[yyvsp].take_blk();
+                let msg = check_object_key(&key);
+                if jv_is_valid(&msg) {
+                    yyerror(
+                        &yyloc,
+                        answer,
+                        errors,
+                        locations,
+                        lexer_param_ptr,
+                        jv_string_value(&msg),
+                    );
+                }
+                jv_free(msg);
                 yyval = YYSType::Blk(gen_dictpair(key, val));
             }
             // case 169: MkDictPair: error ':' ExpD
@@ -2812,6 +2890,13 @@ pub fn jq_parse<T>(locations: &mut Locfile<T>, answer: &mut Block) -> i32 {
     let parse_result = yyparse(answer, &mut errors, locations, &mut lexer_param);
     if debug_parse { eprintln!("DEBUG jq_parse: yyparse returned {}, errors={}", parse_result, errors); }
 
+    if parse_result != 0 && errors == 0 {
+        errors = 1;
+        if locations.error.is_none() {
+            locations.error = Some(format!("jq: error: syntax error at {}, line 1:", locations.fname));
+        }
+    }
+
     // Clean up lexer resources
     jq_yy_delete_buffer(Some(buf), &mut lexer);
     jq_yylex_destroy(&mut lexer);
@@ -2857,18 +2942,13 @@ pub const INSERT: Opcode = Opcode::Invalid;
 /// Creates a block that performs a define-or assignment operation,
 /// which assigns a value only if the path doesn't exist or is null.
 pub fn gen_definedor_assign(object: Block, val: Block) -> Block {
-    let tmp = gen_op_var_fresh(STOREV, "tmp");
-    // Use OpCode::Dup instead of Opcode DUP which isn't the correct type
-    let inner1 = block_join(gen_op_simple(OpCode::Dup), val);
-    // Block doesn't implement Clone, so create a fresh var binding instead
-    let tmp2 = gen_op_var_fresh(STOREV, "tmp");
-    let inner2 = block_join(inner1, tmp2);
-    let definedor_block = gen_definedor(gen_noop(), gen_op_bound(LOADV, tmp));
-    let lambda2 = gen_lambda(definedor_block);
+    let tmp = crate::compile::gen_op_var_fresh(crate::compile::STOREV, "tmp");
+    let load_tmp = crate::compile::gen_op_bound(crate::compile::LOADV, &tmp);
     let lambda1 = gen_lambda(object);
-    let call_args = block_join(lambda1, lambda2);
-    let modify_call = gen_call("_modify", call_args);
-    block_join(inner2, modify_call)
+    let lambda2 = gen_lambda(gen_definedor(gen_noop(), load_tmp));
+    let modify_call = gen_call("_modify", block_join(lambda1, lambda2));
+    let prefix = block_join(block_join(gen_op_simple(OpCode::Dup), val), tmp);
+    block_join(prefix, modify_call)
 }
 /// Copy a string into a Vec<u8> buffer, returning the index of the last character
 ///

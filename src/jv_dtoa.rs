@@ -814,6 +814,9 @@ pub fn jvp_dtoa(
 pub fn jvp_dtoa_fmt(c: &mut DtoaContext, x: f64) -> String {
     let debug = std::env::var("DEBUG_DTOA").is_ok();
     if debug { eprintln!("DEBUG jvp_dtoa_fmt: x={} bits={:#x}", x, x.to_bits()); }
+    if x.is_finite() && x.fract() == 0.0 && x.abs() < 1e21 {
+        return format!("{:.0}", x);
+    }
     let mut decpt = 0i32;
     let mut sign = 0i32;
     let s0 = jvp_dtoa(c, x, 0, 0, &mut decpt, &mut sign);

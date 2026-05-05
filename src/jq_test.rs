@@ -18,21 +18,21 @@ use crate::types;
 use crate::jv;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use crate::execute::{jq_init, jq_compile, jq_teardown, jq_start, jq_next};
-use crate::jv_parse::{jv_parser_new, jv_parser_set_buf, jv_parser_free, jv_parser_next, ExtendedJvParser};
+use crate::execute::{jq_init, jq_compile, jq_teardown, jq_start, jq_next, jq_set_attr, jq_set_error_cb, jq_dump_disassembly};
+use crate::jv_parse::{jv_parser_new, jv_parser_set_buf, jv_parser_free, jv_parser_next, jv_parse, ExtendedJvParser};
 use crate::locfile::jv_is_valid;
 use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::path::Path;
 use crate::jv_print::jv_dump_string;
 use crate::types::*;
 /// Check if buffer contains fail marker
 pub fn checkfail(buf: &str) -> bool {
-    buf.trim_start().starts_with("%%FAIL")
+    buf == "%%FAIL" || buf == "%%FAIL IGNORE MSG"
 }
 /// Check if buffer contains error message marker
 pub fn checkerrormsg(buf: &str) -> bool {
-    let trimmed = buf.trim_start();
-    trimmed.starts_with("%%FAIL ERRMSG")
+    buf == "%%FAIL"
 }
 /// Check if line should be skipped
 pub fn skipline(buf: &str) -> bool {
@@ -192,8 +192,6 @@ pub fn run_jq_tests<R: BufRead>(
     skip: i32,
     take: i32,
 ) {
-    let mut prog = String::new();
-    let mut err_msg = ErrData::default();
     let mut tests = 0;
     let mut passed = 0;
     let mut invalid = 0;
@@ -203,23 +201,29 @@ pub fn run_jq_tests<R: BufRead>(
     let tests_to_skip = if skip > 0 { skip } else { 0 };
     let mut remaining_skip = skip;
     let mut remaining_take = take;
-    let mut _jq: Option<Box<JqState<ErrData>>> = jq_init();
-    let _lib_dirs = if lib_dirs.get_kind() == JvKind::Null {
+    let mut jq: Option<Box<JqState<ErrData>>> = jq_init();
+    let lib_dirs = if lib_dirs.get_kind() == JvKind::Null {
         Jv::array()
     } else {
         lib_dirs
     };
+    if let Some(jq_state) = jq.as_mut() {
+        jq_set_attr(jq_state, Jv::string("JQ_LIBRARY_PATH"), lib_dirs);
+    }
     let lines: Vec<String> = testdata.lines().filter_map(|l| l.ok()).collect();
     let mut line_iter = lines.iter().peekable();
     while let Some(line) = line_iter.next() {
         lineno += 1;
-        prog = line.clone();
+        let prog = line.clone();
         if skipline(&prog) {
             continue;
         }
         if checkfail(&prog) {
             must_fail = true;
             check_msg = checkerrormsg(&prog);
+            if let Some(jq_state) = jq.as_mut() {
+                jq_set_error_cb(jq_state, Some(test_err_cb), Some(Box::new(ErrData::default())));
+            }
             continue;
         }
         let prog = prog.trim_end_matches('\n').trim_end_matches('\r');
@@ -249,8 +253,16 @@ pub fn run_jq_tests<R: BufRead>(
         println!(
             "Test #{}: '{}' at line number {}", tests + tests_to_skip, prog, lineno
         );
-        let compiled = !prog.contains("INVALID_SYNTAX");
+        let compiled = jq_compile(&mut jq, prog) != 0;
         if must_fail {
+            let err_msg = jq
+                .as_ref()
+                .and_then(|jq_state| jq_state.err_cb_data.as_ref())
+                .map(|data| data.buf.clone())
+                .unwrap_or_default();
+            if let Some(jq_state) = jq.as_mut() {
+                jq_set_error_cb(jq_state, None, None);
+            }
             if let Some(buf) = line_iter.next() {
                 lineno += 1;
                 let buf = buf.trim_end_matches('\n').trim_end_matches('\r');
@@ -264,10 +276,10 @@ pub fn run_jq_tests<R: BufRead>(
                     invalid += 1;
                     continue;
                 }
-                if check_msg && buf != err_msg.buf {
+                if check_msg && buf != err_msg {
                     println!(
                         "*** Erroneous test program failed with wrong message ({}) at line {}: {}",
-                        err_msg.buf, lineno, prog
+                        err_msg, lineno, prog
                     );
                     invalid += 1;
                 } else {
@@ -291,16 +303,20 @@ pub fn run_jq_tests<R: BufRead>(
         }
         if verbose {
             println!("Disassembly:");
+            if let Some(jq_state) = jq.as_ref() {
+                jq_dump_disassembly(jq_state, 2);
+            }
             println!();
         }
         if let Some(buf) = line_iter.next() {
             lineno += 1;
-            let input = Jv::null();
+            let input = jv_parse(buf);
             if !input.is_valid() && input.get_kind() != JvKind::Null {
                 println!("*** Input is invalid on line {}: {}", lineno, buf);
                 invalid += 1;
                 continue;
             }
+            jq_start(&mut jq, input, if verbose { JQ_DEBUG_TRACE } else { 0 });
             while let Some(buf) = line_iter.peek() {
                 if skipline(buf) {
                     line_iter.next();
@@ -309,7 +325,7 @@ pub fn run_jq_tests<R: BufRead>(
                 }
                 let buf = line_iter.next().unwrap();
                 lineno += 1;
-                let expected = Jv::null();
+                let expected = jv_parse(buf);
                 if !expected.is_valid() && expected.get_kind() != JvKind::Null {
                     println!(
                         "*** Expected result is invalid on line {}: {}", lineno, buf
@@ -317,7 +333,7 @@ pub fn run_jq_tests<R: BufRead>(
                     invalid += 1;
                     continue;
                 }
-                let actual = Jv::null();
+                let actual = jq_next(&mut jq);
                 if !actual.is_valid() && actual.get_kind() != JvKind::Null {
                     println!(
                         "*** Insufficient results for test at line number {}: {}",
@@ -325,6 +341,17 @@ pub fn run_jq_tests<R: BufRead>(
                     );
                     pass = false;
                     break;
+                } else if !jv::jv_equal(&expected, &actual) {
+                    let expected_str = jv_dump_string(expected.clone(), 0);
+                    let actual_str = jv_dump_string(actual.clone(), 0);
+                    println!(
+                        "*** Expected {}, but got {} for test at line number {}: {}",
+                        expected_str.string_value().unwrap_or("<invalid>"),
+                        actual_str.string_value().unwrap_or("<invalid>"),
+                        lineno,
+                        prog
+                    );
+                    pass = false;
                 }
             }
         } else {
@@ -332,9 +359,23 @@ pub fn run_jq_tests<R: BufRead>(
             break;
         }
         if pass {
+            let extra = jq_next(&mut jq);
+            if extra.is_valid() {
+                let extra_str = jv_dump_string(extra, 0);
+                println!(
+                    "*** Superfluous result: {} for test at line number {}, {}",
+                    extra_str.string_value().unwrap_or("<invalid>"),
+                    lineno,
+                    prog
+                );
+                pass = false;
+            }
+        }
+        if pass {
             passed += 1;
         }
     }
+    jq_teardown(&mut jq);
     let total_skipped = if remaining_skip > 0 {
         tests_to_skip - remaining_skip
     } else {
@@ -401,6 +442,15 @@ pub fn jq_testsuite(libdirs: Jv, verbose: bool, argc: i32, argv: Vec<String>) ->
         match File::open(&path) {
             Ok(file) => {
                 let reader = BufReader::new(file);
+                let libdirs = if libdirs.get_kind() == JvKind::Null {
+                    let mut dirs = Jv::array();
+                    if let Some(parent) = Path::new(&path).parent() {
+                        dirs = dirs.array_append(Jv::string(&parent.join("modules").to_string_lossy()));
+                    }
+                    dirs
+                } else {
+                    libdirs
+                };
                 run_jq_tests(libdirs, verbose, reader, skip, take);
             }
             Err(e) => {
@@ -438,15 +488,16 @@ mod tests {
     #[test]
     fn test_checkfail() {
         assert!(checkfail("%%FAIL"));
-        assert!(checkfail("%%FAIL some message"));
-        assert!(checkfail("  %%FAIL with indent"));
+        assert!(checkfail("%%FAIL IGNORE MSG"));
+        assert!(! checkfail("%%FAIL some message"));
+        assert!(! checkfail("  %%FAIL with indent"));
         assert!(! checkfail("normal line"));
     }
     #[test]
     fn test_checkerrormsg() {
-        assert!(checkerrormsg("%%FAIL ERRMSG"));
-        assert!(checkerrormsg("%%FAIL ERRMSG expected error"));
-        assert!(! checkerrormsg("%%FAIL"));
+        assert!(checkerrormsg("%%FAIL"));
+        assert!(! checkerrormsg("%%FAIL IGNORE MSG"));
+        assert!(! checkerrormsg("%%FAIL ERRMSG"));
         assert!(! checkerrormsg("normal line"));
     }
     #[test]

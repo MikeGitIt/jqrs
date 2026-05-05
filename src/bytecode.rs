@@ -37,7 +37,7 @@ lazy_static::lazy_static! {
         // Opcode order from compile.rs CompileOpcode enum
         descs[0] = OpcodeDescription { op: Opcode::Loadk, name: "LOADK", flags: OP_HAS_CONSTANT, length: 2, stack_in: 1, stack_out: 1 };
         descs[1] = OpcodeDescription { op: Opcode::Dup, name: "DUP", flags: 0, length: 1, stack_in: 1, stack_out: 2 };
-        descs[2] = OpcodeDescription { op: Opcode::Dupn, name: "DUPN", flags: 0, length: 2, stack_in: 0, stack_out: 1 };
+        descs[2] = OpcodeDescription { op: Opcode::Dupn, name: "DUPN", flags: 0, length: 1, stack_in: 1, stack_out: 2 };
         descs[3] = OpcodeDescription { op: Opcode::Dup2, name: "DUP2", flags: 0, length: 1, stack_in: 2, stack_out: 4 };
         descs[4] = OpcodeDescription { op: Opcode::PushkUnder, name: "PUSHK_UNDER", flags: OP_HAS_CONSTANT, length: 2, stack_in: 1, stack_out: 2 };
         descs[5] = OpcodeDescription { op: Opcode::Pop, name: "POP", flags: 0, length: 1, stack_in: 1, stack_out: 0 };
@@ -370,6 +370,7 @@ impl Bytecode {
             subfunctions: Vec::new(),
             nsubfunctions: 0,
             parent: None,
+            parent_ptr: None,
             debuginfo: crate::jv::jv_object(),
         }
     }
