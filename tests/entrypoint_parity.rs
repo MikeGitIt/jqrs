@@ -19,8 +19,17 @@ fn c_jq() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("JQ_C_BIN").map(PathBuf::from) {
         return path.is_file().then_some(path);
     }
-    let default = PathBuf::from("/Users/mickillah/jq/jq");
-    default.is_file().then_some(default)
+    None
+}
+
+fn jq_test_file() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("JQ_TEST_FILE").map(PathBuf::from) {
+        return path.is_file().then_some(path);
+    }
+    std::env::var_os("JQ_SRC")
+        .map(PathBuf::from)
+        .map(|src| src.join("tests").join("jq.test"))
+        .filter(|path| path.is_file())
 }
 
 fn run(bin: &PathBuf, args: &[String], stdin: Option<&[u8]>) -> RunOutput {
@@ -123,11 +132,10 @@ fn rust_run_tests_executes_programs_and_compares_outputs() {
 
 #[test]
 fn rust_run_tests_first_jq_cases() {
-    let test_file = PathBuf::from("/Users/mickillah/jq/tests/jq.test");
-    if !test_file.is_file() {
-        eprintln!("skipping jq.test smoke: {} not found", test_file.display());
+    let Some(test_file) = jq_test_file() else {
+        eprintln!("skipping jq.test smoke: set JQ_TEST_FILE or JQ_SRC");
         return;
-    }
+    };
     let rust_bin = rust_jq();
     let args = vec![
         "--run-tests".to_string(),
@@ -148,7 +156,7 @@ fn rust_run_tests_first_jq_cases() {
 #[test]
 fn parity_entrypoint_smoke() {
     let Some(c_bin) = c_jq() else {
-        eprintln!("skipping parity smoke: set JQ_C_BIN or build /Users/mickillah/jq/jq");
+        eprintln!("skipping parity smoke: set JQ_C_BIN");
         return;
     };
     let rust_bin = rust_jq();

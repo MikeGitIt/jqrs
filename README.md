@@ -15,7 +15,8 @@ been brought far enough to run jq's upstream `tests/jq.test` file.
 Recently verified:
 
 ```sh
-./target/debug/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
+JQ_SRC=/path/to/jq
+./target/debug/jqrs --run-tests "$JQ_SRC/tests/jq.test"
 ```
 
 Expected result:
@@ -35,10 +36,17 @@ the C jq binary.
 
 Use these references when changing behavior:
 
-- C jq source: `/Users/mickillah/jq`
-- C jq entry point: `/Users/mickillah/jq/src/main.c`
-- C jq test file: `/Users/mickillah/jq/tests/jq.test`
+- C jq source: `$JQ_SRC`
+- C jq entry point: `$JQ_SRC/src/main.c`
+- C jq test file: `$JQ_SRC/tests/jq.test`
 - Rust root crate: this repository root
+
+Set `JQ_SRC` to the local checkout of the C jq repository when running parity
+checks:
+
+```sh
+export JQ_SRC=/path/to/jq
+```
 
 Directories whose names start with `jq`, such as `jqvert-test/`,
 `jqvert-test_rwasm_rewrite/`, and `jq_port_*`, are reference, generated, or
@@ -111,21 +119,25 @@ cargo test entrypoint
 Run jq's upstream test file through the Rust test-suite runner:
 
 ```sh
-./target/debug/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
+JQ_SRC=/path/to/jq
+./target/debug/jqrs --run-tests "$JQ_SRC/tests/jq.test"
 ```
 
 For faster local parity checks, use the release binary:
 
 ```sh
 cargo build --release
-./target/release/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
+JQ_SRC=/path/to/jq
+./target/release/jqrs --run-tests "$JQ_SRC/tests/jq.test"
 ```
 
 The integration parity tests compare Rust CLI behavior against a C jq binary.
-They use `JQ_C_BIN` when set and otherwise try `/Users/mickillah/jq/jq`.
+Set `JQ_C_BIN` to the jq binary built from the C checkout. Tests that need
+jq's upstream `jq.test` file read it from `JQ_TEST_FILE` when set, or from
+`$JQ_SRC/tests/jq.test`.
 
 ```sh
-JQ_C_BIN=/Users/mickillah/jq/jq cargo test entrypoint_parity
+JQ_SRC=/path/to/jq JQ_C_BIN=/path/to/jq/jq cargo test entrypoint_parity
 ```
 
 The parity checks compare exit code, stdout, and stderr for selected CLI cases.
@@ -185,20 +197,22 @@ SPECS/                      design notes and investigation docs
 For a behavior mismatch, start with a small Rust-vs-C comparison:
 
 ```sh
-/Users/mickillah/jq/jq '<filter>' input.json
+JQ_C_BIN=/path/to/jq/jq
+"$JQ_C_BIN" '<filter>' input.json
 ./target/debug/jqrs '<filter>' input.json
 ```
 
 Then add or narrow a parity case:
 
 ```sh
-JQ_C_BIN=/Users/mickillah/jq/jq cargo test entrypoint_parity -- --nocapture
+JQ_SRC=/path/to/jq JQ_C_BIN=/path/to/jq/jq cargo test entrypoint_parity -- --nocapture
 ```
 
 For jq test-suite slices:
 
 ```sh
-./target/debug/jqrs --run-tests --skip 340 --take 20 /Users/mickillah/jq/tests/jq.test
+JQ_SRC=/path/to/jq
+./target/debug/jqrs --run-tests --skip 340 --take 20 "$JQ_SRC/tests/jq.test"
 ```
 
 Use the C jq result as the oracle for stdout, stderr, exit code, parser errors,
@@ -222,7 +236,8 @@ Before handing off behavior changes, prefer this minimum verification set:
 ```sh
 cargo build
 cargo test
-./target/debug/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
+JQ_SRC=/path/to/jq
+./target/debug/jqrs --run-tests "$JQ_SRC/tests/jq.test"
 git diff --check
 ```
 
