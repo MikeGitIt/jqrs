@@ -9,9 +9,9 @@ struct RunOutput {
 }
 
 fn rust_jq() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_jq_with_autobuild")
+    std::env::var_os("CARGO_BIN_EXE_jqrs")
         .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_jq_with_autobuild").map(PathBuf::from))
+        .or_else(|| option_env!("CARGO_BIN_EXE_jqrs").map(PathBuf::from))
         .expect("Cargo did not provide the Rust jq binary path")
 }
 

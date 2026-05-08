@@ -1,8 +1,7 @@
 # jqrs
 
 `jqrs` is a Rust 2021 port of jq's C implementation. The active crate lives at
-the repository root and builds a jq-like command line binary named
-`jq_with_autobuild`.
+the repository root and builds a jq-like command line binary named `jqrs`.
 
 This is not an idiomatic rewrite of jq. The codebase was emitted from
 LLM-assisted C analysis and then repaired toward behavioral parity with jq.
@@ -16,7 +15,7 @@ been brought far enough to run jq's upstream `tests/jq.test` file.
 Recently verified:
 
 ```sh
-./target/debug/jq_with_autobuild --run-tests /Users/mickillah/jq/tests/jq.test
+./target/debug/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
 ```
 
 Expected result:
@@ -62,8 +61,8 @@ cargo build --release
 The binary paths are:
 
 ```text
-target/debug/jq_with_autobuild
-target/release/jq_with_autobuild
+target/debug/jqrs
+target/release/jqrs
 ```
 
 ## Run
@@ -77,22 +76,22 @@ cargo run -- '.foo' input.json
 Run the built binary directly:
 
 ```sh
-./target/debug/jq_with_autobuild '.foo' input.json
+./target/debug/jqrs '.foo' input.json
 ```
 
 Read JSON from standard input:
 
 ```sh
-printf '{"foo":1}\n' | ./target/debug/jq_with_autobuild '.foo'
+printf '{"foo":1}\n' | ./target/debug/jqrs '.foo'
 ```
 
 Examples:
 
 ```sh
-./target/debug/jq_with_autobuild -n '{ok: true}'
-./target/debug/jq_with_autobuild -r '.name' data.json
-./target/debug/jq_with_autobuild --arg name value -n '$name'
-./target/debug/jq_with_autobuild --slurpfile data input.json -n '$data'
+./target/debug/jqrs -n '{ok: true}'
+./target/debug/jqrs -r '.name' data.json
+./target/debug/jqrs --arg name value -n '$name'
+./target/debug/jqrs --slurpfile data input.json -n '$data'
 ```
 
 ## Test
@@ -112,14 +111,14 @@ cargo test entrypoint
 Run jq's upstream test file through the Rust test-suite runner:
 
 ```sh
-./target/debug/jq_with_autobuild --run-tests /Users/mickillah/jq/tests/jq.test
+./target/debug/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
 ```
 
 For faster local parity checks, use the release binary:
 
 ```sh
 cargo build --release
-./target/release/jq_with_autobuild --run-tests /Users/mickillah/jq/tests/jq.test
+./target/release/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
 ```
 
 The integration parity tests compare Rust CLI behavior against a C jq binary.
@@ -187,7 +186,7 @@ For a behavior mismatch, start with a small Rust-vs-C comparison:
 
 ```sh
 /Users/mickillah/jq/jq '<filter>' input.json
-./target/debug/jq_with_autobuild '<filter>' input.json
+./target/debug/jqrs '<filter>' input.json
 ```
 
 Then add or narrow a parity case:
@@ -199,7 +198,7 @@ JQ_C_BIN=/Users/mickillah/jq/jq cargo test entrypoint_parity -- --nocapture
 For jq test-suite slices:
 
 ```sh
-./target/debug/jq_with_autobuild --run-tests --skip 340 --take 20 /Users/mickillah/jq/tests/jq.test
+./target/debug/jqrs --run-tests --skip 340 --take 20 /Users/mickillah/jq/tests/jq.test
 ```
 
 Use the C jq result as the oracle for stdout, stderr, exit code, parser errors,
@@ -223,7 +222,7 @@ Before handing off behavior changes, prefer this minimum verification set:
 ```sh
 cargo build
 cargo test
-./target/debug/jq_with_autobuild --run-tests /Users/mickillah/jq/tests/jq.test
+./target/debug/jqrs --run-tests /Users/mickillah/jq/tests/jq.test
 git diff --check
 ```
 

@@ -1,5 +1,5 @@
 [package]
-name = "jq_with_autobuild"
+name = "jqrs"
 version = "0.1.0"
 edition = "2021"
 

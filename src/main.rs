@@ -15,29 +15,29 @@ use std::io::{self, Write, IsTerminal};
 use std::path::Path;
 use std::process as std_process;
 use std::rc::Rc;
-use jq_with_autobuild::jv::{
+use jqrs::jv::{
     Jv, JvKind, jv_string_value, jv_number_value, jv_invalid_get_msg,
     jv_object_iter, jv_object_iter_key, jv_object_iter_next, jv_object_iter_valid,
 };
-use jq_with_autobuild::jv_file::jv_load_file;
-use jq_with_autobuild::jv_print::{
+use jqrs::jv_file::jv_load_file;
+use jqrs::jv_print::{
     jv_dumpf, jv_dump_string, jq_set_colors, JV_PRINT_ASCII, JV_PRINT_COLOR,
     JV_PRINT_ISATTY, JV_PRINT_PRETTY, JV_PRINT_SORTED, JV_PRINT_TAB,
 };
-use jq_with_autobuild::jv_parse::jv_parse;
-use jq_with_autobuild::execute::{
+use jqrs::jv_parse::jv_parse;
+use jqrs::execute::{
     jq_init, jq_start, jq_next, jq_halted, jq_get_exit_code, jq_get_error_message,
     jq_compile_args, jq_set_attr, jq_set_debug_cb, jq_set_input_cb, jq_set_stderr_cb,
     jq_dump_disassembly, jq_teardown,
 };
-use jq_with_autobuild::jq_test::jq_testsuite;
-use jq_with_autobuild::types::{JqState, JqUtilInputState};
-use jq_with_autobuild::util::{
+use jqrs::jq_test::jq_testsuite;
+use jqrs::types::{JqState, JqUtilInputState};
+use jqrs::util::{
     jq_util_input_init, jq_util_input_add_input, jq_util_input_errors,
     jq_util_input_next_input, jq_util_input_set_parser, jq_util_input_free,
     jq_realpath, jv_is_valid,
 };
-use jq_with_autobuild::jv_parse::jv_parser_new;
+use jqrs::jv_parse::jv_parser_new;
 pub const JQ_OK: i32 = 0;
 pub const JQ_OK_NULL_KIND: i32 = -1;
 pub const JQ_ERROR_SYSTEM: i32 = 2;
@@ -115,7 +115,7 @@ fn input_position(input_state: Option<&SharedInputState>) -> String {
 fn invalid_has_msg(value: &Jv) -> bool {
     !jv_is_valid(value)
         && value.get_kind() == JvKind::Invalid
-        && (value.kind_flags & jq_with_autobuild::jv::JVP_PAYLOAD_ALLOCATED) != 0
+        && (value.kind_flags & jqrs::jv::JVP_PAYLOAD_ALLOCATED) != 0
 }
 fn object_has_key(object: &Jv, key: &str) -> bool {
     let mut iter = jv_object_iter(object);
