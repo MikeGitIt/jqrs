@@ -142,7 +142,7 @@ use crate::util::_jq_memmem;
 use crate::deccontext::decContextClearStatus;
 // Note: decContextDefault is defined locally in this file
 use std::cell::RefCell;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
 use crate::jv_alloc::jv_mem_realloc;
 // Note: jv_mem_alloc, jv_mem_free are defined locally in this file
@@ -158,6 +158,18 @@ use std::hash::{Hash, Hasher};
 use std::fmt;
 use std::cmp::{max, Ordering};
 use crate::inject_errors::fwrite;
+
+#[inline]
+fn debug_jv_enabled() -> bool {
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("DEBUG_JV").is_some())
+}
+
+#[inline]
+fn debug_exec_enabled() -> bool {
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("DEBUG_EXEC").is_some())
+}
 // Note: Jv, JvKind, JvRefcnt, JvpArray, JvpString, JvpLiteralNumber, JvpInvalid,
 // jv_copy, jv_free, jv_null, jvp_array_slice, jvp_clamp_slice_params,
 // jv_array, jv_array_append, jv_array_get, jv_array_length, jv_array_set,
@@ -309,7 +321,11 @@ pub fn jvp_string_copy_replace_bad(data: &[u8]) -> Jv {
 }
 /// Create a string Jv from sized data
 pub fn jv_string_sized(str_data: &str, len: usize) -> Jv {
-    let data = str_data.chars().take(len).collect::<String>();
+    let len = len.min(str_data.len());
+    let data = match str_data.get(..len) {
+        Some(s) => s.to_owned(),
+        None => String::from_utf8_lossy(&str_data.as_bytes()[..len]).into_owned(),
+    };
     // Don't precompute hash - let jvp_string_hash_internal compute it lazily with MurmurHash3
     let payload = JvpString {
         refcnt: 1,
@@ -356,17 +372,13 @@ fn jvp_object_mask(o: &Jv) -> u32 {
     assert!(o.has_kind(JvKind::Object), "JVP_HAS_KIND(o, JV_KIND_OBJECT)");
     ((o.size * 2) - 1) as u32
 }
-/// Get pointer to object - JvpObject doesn't have buckets, returns None
-fn jvp_object_buckets(_o: &Jv) -> Option<&[i32]> {
-    // JvpObject in types.rs doesn't have a buckets field
-    // Linear search through elements is used instead
-    None
+/// Get pointer to object buckets
+fn jvp_object_buckets(o: &Jv) -> Option<&[i32]> {
+    jvp_object_ptr(o).map(|obj| obj.buckets.as_slice())
 }
-/// Get mutable pointer to object buckets - JvpObject doesn't have buckets, returns None
-fn jvp_object_buckets_mut(_o: &mut Jv) -> Option<&mut Vec<i32>> {
-    // JvpObject in types.rs doesn't have a buckets field
-    // Linear search through elements is used instead
-    None
+/// Get mutable pointer to object buckets
+fn jvp_object_buckets_mut(o: &mut Jv) -> Option<&mut Vec<i32>> {
+    jvp_object_ptr_mut(o).map(|obj| &mut obj.buckets)
 }
 /// Explode a string into an array of codepoints
 pub fn jv_string_explode(j: Jv) -> Jv {
@@ -480,70 +492,92 @@ fn jvp_object_slot_live(slot: &ObjectSlot) -> bool {
     jv_get_kind(&slot.string) == JvKind::String
 }
 
+fn jvp_object_write_index(object: &mut Jv, key: Jv) -> Option<usize> {
+    assert!(jvp_has_kind(object, JvKind::Object));
+    assert!(jvp_has_kind(&key, JvKind::String));
+    let old = std::mem::replace(object, jv_invalid());
+    *object = jvp_object_unshare(old);
+
+    let hash = jvp_string_hash(&key);
+    loop {
+        if object.u == 0 {
+            jv_free(key);
+            return None;
+        }
+
+        let bucket_idx = jvp_object_find_bucket(object, &key)?;
+        let mut slot_idx = {
+            let obj = unsafe { &*(object.u as *const JvpObject) };
+            obj.buckets[bucket_idx]
+        };
+        while slot_idx >= 0 {
+            let slot = {
+                let obj = unsafe { &*(object.u as *const JvpObject) };
+                &obj.elements[slot_idx as usize]
+            };
+            if slot.hash == hash && jvp_string_equal(&slot.string, &key) {
+                jv_free(key);
+                return Some(slot_idx as usize);
+            }
+            slot_idx = slot.next;
+        }
+
+        let has_room = {
+            let obj = unsafe { &*(object.u as *const JvpObject) };
+            obj.next_free < jvp_object_size(object)
+        };
+        if !has_room {
+            let old = std::mem::replace(object, jv_invalid());
+            *object = jvp_object_rehash(old);
+            continue;
+        }
+
+        let obj = unsafe { &mut *(object.u as *mut JvpObject) };
+        let new_idx = obj.next_free as usize;
+        obj.next_free += 1;
+        obj.elements[new_idx].next = obj.buckets[bucket_idx];
+        obj.buckets[bucket_idx] = new_idx as i32;
+        obj.elements[new_idx].hash = hash;
+        obj.elements[new_idx].string = key;
+        obj.elements[new_idx].value = jv_invalid();
+        return Some(new_idx);
+    }
+}
+
+fn jvp_object_insert_moved(object: &mut Jv, key: Jv, value: Jv) {
+    assert!(jvp_has_kind(object, JvKind::Object));
+    assert!(jvp_has_kind(&key, JvKind::String));
+    let hash = jvp_string_hash(&key);
+    let bucket_idx = jvp_object_find_bucket(object, &key).expect("object buckets must exist");
+    let obj = unsafe { &mut *(object.u as *mut JvpObject) };
+    assert!(obj.next_free < jvp_object_size(object));
+    let new_idx = obj.next_free as usize;
+    obj.next_free += 1;
+    obj.elements[new_idx].next = obj.buckets[bucket_idx];
+    obj.buckets[bucket_idx] = new_idx as i32;
+    obj.elements[new_idx].hash = hash;
+    obj.elements[new_idx].string = key;
+    obj.elements[new_idx].value = value;
+}
+
 /// Set object value by key
 pub fn jv_object_set(mut j: Jv, key: Jv, val: Jv) -> Jv {
     assert!(jvp_has_kind(&j, JvKind::Object));
     assert!(jvp_has_kind(&key, JvKind::String));
-    j = jvp_object_unshare(j);
-    if j.u != 0 {
+    if let Some(idx) = jvp_object_write_index(&mut j, key) {
         let obj = unsafe { &mut *(j.u as *mut JvpObject) };
-        let mut key_clone = jv_copy(&key);
-        let key_hash = jvp_string_hash_internal(&mut key_clone);
-        jv_free(key_clone);
-        // Linear search for existing key
-        for slot in &mut obj.elements {
-            if jvp_object_slot_live(slot) && slot.hash == key_hash && jv_equal(&slot.string, &key) {
-                jv_free(key);
-                let old = std::mem::replace(&mut slot.value, val);
-                jv_free(old);
-                return j;
-            }
-        }
-        // Add new slot
-        let new_slot = ObjectSlot {
-            next: -1,
-            hash: key_hash,
-            string: key,
-            value: val,
-        };
-        obj.elements.push(new_slot);
-        obj.next_free += 1;
+        let old = std::mem::replace(&mut obj.elements[idx].value, val);
+        jv_free(old);
+    } else {
+        jv_free(val);
     }
     j
 }
 /// Write to an object slot, creating if necessary
 pub fn jvp_object_write<'a>(object: &'a mut Jv, key: &Jv) -> Option<&'a mut Jv> {
-    // Create a copy to unshare, then update object
-    let unshared = jvp_object_unshare(object.clone());
-    *object = unshared;
-
-    let mut key_clone = jv_copy(key);
-    let hash = jvp_string_hash_internal(&mut key_clone);
-
-    if object.u == 0 {
-        return None;
-    }
-
+    let idx = jvp_object_write_index(object, jv_copy(key))?;
     let obj = unsafe { &mut *(object.u as *mut JvpObject) };
-
-    // Linear search for existing key
-    for (idx, slot) in obj.elements.iter().enumerate() {
-        if jvp_object_slot_live(slot) && slot.hash == hash && jv_string_equal(&slot.string, key) {
-            return Some(&mut obj.elements[idx].value);
-        }
-    }
-
-    // Add new slot
-    let new_idx = obj.elements.len();
-    obj.elements.push(ObjectSlot {
-        next: -1,
-        hash,
-        string: jv_copy(key),
-        value: Jv::default(),
-    });
-    obj.next_free += 1;
-
-    Some(&mut obj.elements[new_idx].value)
+    Some(&mut obj.elements[idx].value)
 }
 /// Unshare object (copy-on-write)
 pub fn jvp_object_unshare(object: Jv) -> Jv {
@@ -558,14 +592,15 @@ pub fn jvp_object_unshare(object: Jv) -> Jv {
         return object;
     }
 
-    let size = obj.elements.len() as i32;
+    let size = jvp_object_size(&object);
     let mut new_object = jvp_object_new(size);
 
     if new_object.u != 0 {
         let new_obj = unsafe { &mut *(new_object.u as *mut JvpObject) };
         new_obj.next_free = obj.next_free;
-        for old_slot in &obj.elements {
-            let new_slot = ObjectSlot {
+        for i in 0..size as usize {
+            let old_slot = &obj.elements[i];
+            new_obj.elements[i] = ObjectSlot {
                 next: old_slot.next,
                 hash: old_slot.hash,
                 string: if jv_get_kind(&old_slot.string) != JvKind::Null {
@@ -579,8 +614,8 @@ pub fn jvp_object_unshare(object: Jv) -> Jv {
                     old_slot.value.clone()
                 },
             };
-            new_obj.elements.push(new_slot);
         }
+        new_obj.buckets.clone_from(&obj.buckets);
     }
     jvp_object_free(object);
     new_object
@@ -591,21 +626,14 @@ fn jvp_object_contains(a: &Jv, b: &Jv) -> i32 {
         return 0;
     }
 
-    let obj_a = unsafe { &*(a.u as *const JvpObject) };
     let obj_b = unsafe { &*(b.u as *const JvpObject) };
 
     for slot in &obj_b.elements {
         if jvp_object_slot_live(slot) {
-            let found = obj_a
-                .elements
-                .iter()
-                .any(|s| {
-                    jvp_object_slot_live(s)
-                        && s.hash == slot.hash
-                        && jv_string_equal(&s.string, &slot.string)
-                        && jv_contains(jv_copy(&s.value), jv_copy(&slot.value)) != 0
-                });
-            if !found {
+            let Some(a_value) = jvp_object_read(a, &slot.string) else {
+                return 0;
+            };
+            if jv_contains(jv_copy(a_value), jv_copy(&slot.value)) == 0 {
                 return 0;
             }
         }
@@ -656,44 +684,7 @@ pub fn jv_string_length_bytes(j: &Jv) -> i32 {
 }
 /// Copy a JV value (increment reference count if applicable)
 pub fn jv_copy(j: &Jv) -> Jv {
-    let kind = jv_get_kind(j);
-    match kind {
-        JvKind::String => {
-            if let Ok(mut storage) = STRING_STORAGE.lock() {
-                if let Some(s) = storage.get_mut(&j.u) {
-                    s.refcnt += 1;
-                }
-            }
-        }
-        JvKind::Array => {
-            if j.u != 0 {
-                let arr = unsafe { &mut *(j.u as *mut JvpArray) };
-                arr.refcnt += 1;
-            }
-        }
-        JvKind::Object => {
-            if let Ok(mut storage) = OBJECT_STORAGE.lock() {
-                if let Some(obj) = storage.get_mut(&j.u) {
-                    obj.refcnt += 1;
-                }
-            }
-        }
-        JvKind::Number if jvp_is_literal_number(j) => {
-            if let Ok(mut storage) = NUMBER_STORAGE.lock() {
-                if let Some(num) = storage.get_mut(&j.u) {
-                    num.refcnt += 1;
-                }
-            }
-        }
-        JvKind::Invalid => {
-            if j.u != 0 && (j.kind_flags & JVP_PAYLOAD_ALLOCATED) != 0 {
-                let inv = unsafe { &mut *(j.u as *mut JvpInvalid) };
-                inv.refcnt += 1;
-            }
-        }
-        _ => {}
-    }
-    j.clone()
+    jv_copy_internal(j)
 }
 /// Free a Jv value, following C semantics:
 /// - Decrement refcount
@@ -984,19 +975,7 @@ pub fn jv_string(s: &str) -> Jv {
 }
 /// Create an empty object
 pub fn jv_object() -> Jv {
-    let obj = JvpObject {
-        refcnt: 1,
-        next_free: 0,
-        elements: Vec::new(),
-    };
-    let ptr = Box::into_raw(Box::new(obj));
-    Jv {
-        kind_flags: JvKind::Object as u8 | JVP_PAYLOAD_ALLOCATED,
-        pad_: 0,
-        offset: 0,
-        size: 8,
-        u: ptr as u64,
-    }
+    jvp_object_new(8)
 }
 /// Create a null Jv
 pub fn jv_null() -> Jv {
@@ -1188,24 +1167,27 @@ fn jvp_object_ptr_mut(o: &Jv) -> Option<&mut JvpObject> {
 }
 /// Get object size (number of slots)
 pub fn jvp_object_size(object: &Jv) -> i32 {
-    if let Some(obj) = jvp_object_ptr(object) { obj.elements.len() as i32 } else { 0 }
+    if object.u == 0 { 0 } else { object.size }
 }
 /// Create new object with given size
 fn jvp_object_new(size: i32) -> Jv {
+    assert!(size > 0 && (size & (size - 1)) == 0);
     let mut elements = Vec::with_capacity(size as usize);
-    for _ in 0..size {
+    for i in 0..size {
         elements
             .push(ObjectSlot {
-                next: -1,
+                next: i - 1,
                 hash: 0,
                 string: jv_null(),
                 value: jv_null(),
             });
     }
+    let buckets = vec![-1; (size * 2) as usize];
     let obj = Box::new(JvpObject {
         refcnt: 1,
         next_free: 0,
         elements,
+        buckets,
     });
     let ptr = Box::into_raw(obj);
     Jv {
@@ -1251,11 +1233,11 @@ pub fn jvp_object_free(object: Jv) {
     obj.refcnt -= 1;
     if obj.refcnt == 0 {
         let obj = unsafe { Box::from_raw(object.u as *mut JvpObject) };
-        for slot in obj.elements.iter() {
+        for slot in obj.elements.into_iter() {
             if jv_get_kind(&slot.string) != JvKind::Null {
                 // C: jvp_string_free(slot->string); jv_free(slot->value);
-                jv_free(slot.string.clone());
-                jv_free(slot.value.clone());
+                jv_free(slot.string);
+                jv_free(slot.value);
             }
         }
     }
@@ -1506,7 +1488,7 @@ pub fn jv_array_length(j: &Jv) -> i32 {
 }
 /// Get element from array at index
 pub fn jv_array_get(a: Jv, idx: i32) -> Jv {
-    let debug = std::env::var("DEBUG_JV").is_ok();
+    let debug = debug_jv_enabled();
     assert!(a.has_kind(JvKind::Array), "JVP_HAS_KIND(a, JV_KIND_ARRAY)");
     if idx < 0 || idx >= a.size {
         if debug { eprintln!("jv_array_get: idx={} out of bounds (size={})", idx, a.size); }
@@ -1566,18 +1548,10 @@ pub fn jv_object_length(j: &Jv) -> i32 {
 pub fn jv_object_get(j: &Jv, key: Jv) -> Jv {
     assert!(jvp_has_kind(j, JvKind::Object));
     assert!(jvp_has_kind(&key, JvKind::String));
-    if j.u == 0 {
+    if let Some(slot) = jvp_object_read(j, &key) {
+        let value = jv_copy(slot);
         jv_free(key);
-        return jv_null();
-    }
-    let obj = unsafe { &*(j.u as *const JvpObject) };
-    let key_hash = jvp_string_hash(&key);
-    // Linear search through elements
-    for slot in &obj.elements {
-        if jvp_object_slot_live(slot) && slot.hash == key_hash && jv_equal(&slot.string, &key) {
-            jv_free(key);
-            return jv_copy(&slot.value);
-        }
+        return value;
     }
     jv_free(key);
     jv_null()
@@ -1586,14 +1560,7 @@ pub fn jv_object_get(j: &Jv, key: Jv) -> Jv {
 pub fn jv_object_has_key(j: &Jv, key: &Jv) -> bool {
     assert!(jvp_has_kind(j, JvKind::Object));
     assert!(jvp_has_kind(key, JvKind::String));
-    if j.u == 0 {
-        return false;
-    }
-    let obj = unsafe { &*(j.u as *const JvpObject) };
-    let key_hash = jvp_string_hash(key);
-    obj.elements.iter().any(|slot| {
-        jvp_object_slot_live(slot) && slot.hash == key_hash && jv_equal(&slot.string, key)
-    })
+    jvp_object_read(j, key).is_some()
 }
 
 /// Object iterator - returns first index
@@ -1893,11 +1860,11 @@ fn jvp_object_find_bucket(object: &Jv, key: &Jv) -> Option<usize> {
         return None;
     }
     let obj = unsafe { &*(object.u as *const JvpObject) };
-    if obj.elements.is_empty() {
+    if obj.buckets.is_empty() {
         return None;
     }
     let hash = jvp_string_hash(key);
-    let bucket = (hash as usize) % obj.elements.len();
+    let bucket = (jvp_object_mask(object) & hash) as usize;
     Some(bucket)
 }
 /// Get object slot at index
@@ -1955,6 +1922,35 @@ mod tests {
         let obj = jvp_object_new(4);
         assert_eq!(jv_get_kind(& obj), JvKind::Object);
         assert_eq!(obj.size, 4);
+        jv_free(obj);
+    }
+
+    #[test]
+    fn test_jv_object_bucket_set_get_delete_rehash() {
+        let mut obj = jv_object();
+        for i in 0..32 {
+            obj = jv_object_set(obj, jv_string(&format!("k{}", i)), jv_number(i as f64));
+        }
+
+        assert_eq!(jv_object_length(&obj), 32);
+        assert!(jvp_object_size(&obj) >= 32);
+
+        for i in 0..32 {
+            let value = jv_object_get(&obj, jv_string(&format!("k{}", i)));
+            assert_eq!(jv_number_value(&value), i as f64);
+            jv_free(value);
+        }
+
+        obj = jv_object_set(obj, jv_string("k8"), jv_number(800.0));
+        let value = jv_object_get(&obj, jv_string("k8"));
+        assert_eq!(jv_number_value(&value), 800.0);
+        jv_free(value);
+
+        obj = jv_object_delete(obj, jv_string("k8"));
+        assert_eq!(jv_object_length(&obj), 31);
+        let missing = jv_string("k8");
+        assert!(!jv_object_has_key(&obj, &missing));
+        jv_free(missing);
         jv_free(obj);
     }
 }
@@ -2137,27 +2133,21 @@ pub fn jvp_object_rehash(object: Jv) -> Jv {
     assert!(jvp_has_kind(&object, JvKind::Object), "JVP_HAS_KIND(object, JV_KIND_OBJECT)");
     let size = jvp_object_size(&object);
     let mut new_object = jvp_object_new(size * 2);
-    if let Some(obj_ptr) = jvp_object_ptr(&object) {
+    if object.u != 0 {
+        let obj_ptr = unsafe { &mut *(object.u as *mut JvpObject) };
+        assert!(obj_ptr.refcnt == 1);
         for i in 0..size as usize {
             if i < obj_ptr.elements.len() {
-                let slot = &obj_ptr.elements[i];
-                if jv_get_kind(&slot.string) == JvKind::Null {
+                if jv_get_kind(&obj_ptr.elements[i].string) == JvKind::Null {
                     continue;
                 }
-                let mut new_bucket: i32 = 0;
-                let key = jv_copy(&slot.string);
-                let value = jv_copy(&slot.value);
-                if let Some(new_slot) = jvp_object_add_slot(
-                    &mut new_object,
-                    key,
-                    &mut new_bucket,
-                ) {
-                    new_slot.value = value;
-                }
+                let key = std::mem::replace(&mut obj_ptr.elements[i].string, jv_null());
+                let value = std::mem::replace(&mut obj_ptr.elements[i].value, jv_null());
+                jvp_object_insert_moved(&mut new_object, key, value);
             }
         }
+        let _ = unsafe { Box::from_raw(object.u as *mut JvpObject) };
     }
-    jv_free(object);
     new_object
 }
 /// Append a UTF-8 codepoint to a string
@@ -2280,12 +2270,13 @@ pub fn jvp_object_find_slot<'a>(
     bucket: &mut i32,
 ) -> Option<&'a ObjectSlot> {
     let hash = jvp_string_hash(keystr);
-    let mut curr_opt = jvp_object_get_slot(object, *bucket);
-    while let Some(curr) = curr_opt {
+    let mut curr_idx = *bucket;
+    while curr_idx >= 0 {
+        let curr = jvp_object_get_slot(object, curr_idx)?;
         if jvp_object_slot_live(curr) && curr.hash == hash && jvp_string_equal(keystr, &curr.string) {
             return Some(curr);
         }
-        curr_opt = jvp_object_next_slot(object, curr);
+        curr_idx = curr.next;
     }
     None
 }
@@ -2325,17 +2316,12 @@ fn jvp_object_read<'a>(object: &'a Jv, key: &Jv) -> Option<&'a Jv> {
     if object.u == 0 {
         return None;
     }
-    let obj = unsafe { &*(object.u as *const JvpObject) };
-    let key_str = jv_string_value(key);
-    for slot in &obj.elements {
-        if slot.next != -2 {
-            let slot_key_str = jv_string_value(&slot.string);
-            if key_str == slot_key_str {
-                return Some(&slot.value);
-            }
-        }
-    }
-    None
+    let bucket_idx = jvp_object_find_bucket(object, key)?;
+    let mut bucket = {
+        let obj = unsafe { &*(object.u as *const JvpObject) };
+        obj.buckets[bucket_idx]
+    };
+    jvp_object_find_slot(object, key, &mut bucket).map(|slot| &slot.value)
 }
 /// Check if object has a key
 pub fn jv_object_has(object: Jv, key: Jv) -> i32 {
@@ -2383,10 +2369,11 @@ fn jv_null_value() -> Jv {
 /// Append buffer to string, handling invalid UTF-8
 pub fn jv_string_append_buf(a: Jv, buf: &[u8], len: i32) -> Jv {
     let len = len as usize;
-    if jvp_utf8_is_valid(buf) != 0 {
-        jvp_string_append(a, buf, len as u32)
+    let data = &buf[..len.min(buf.len())];
+    if jvp_utf8_is_valid(data) != 0 {
+        jvp_string_append(a, data, data.len() as u32)
     } else {
-        let b = jvp_string_copy_replace_bad(buf);
+        let b = jvp_string_copy_replace_bad(data);
         jv_string_concat(a, b)
     }
 }
@@ -2569,7 +2556,7 @@ fn jvp_number_flags(number_type: u8, allocated: bool) -> u8 {
 /// Consumes the input value.
 pub fn jv_invalid_get_msg(inv: Jv) -> Jv {
     assert!(jvp_has_kind(& inv, JvKind::Invalid), "JVP_HAS_KIND(inv, JV_KIND_INVALID)");
-    let debug = std::env::var("DEBUG_EXEC").is_ok();
+    let debug = debug_exec_enabled();
     let expected = jvp_invalid_allocated_flags();
     if debug {
         eprintln!("DEBUG jv_invalid_get_msg: inv.kind_flags=0x{:02x} expected=0x{:02x} inv.u=0x{:x}",
@@ -2651,6 +2638,7 @@ fn jv_get_payload(jv: &Jv) -> JvPayload {
                 refcnt: 1,
                 next_free: -1,
                 elements: Vec::new(),
+                buckets: Vec::new(),
             })
         }
         JV_KIND_ARRAY => {
@@ -2797,23 +2785,37 @@ fn jvp_object_find_slot_mut<'a>(
 /// Delete key from object
 pub fn jvp_object_delete(object: &mut Jv, key: &Jv) -> i32 {
     assert!(jvp_has_kind(key, JvKind::String));
-    *object = jvp_object_unshare(object.clone());
+    let old = std::mem::replace(object, jv_invalid());
+    *object = jvp_object_unshare(old);
     let hash = jvp_string_hash(key);
-    let size = jvp_object_size(object);
-    for i in 0..size {
-        if let Some(slot) = jvp_object_get_slot(object, i) {
-            if jv_get_kind(&slot.string) != JvKind::Null {
-                if slot.hash == hash && jvp_string_equal(key, &slot.string) {
-                    if let Some(slot_mut) = jvp_object_get_slot_mut(object, i) {
-                        jvp_string_free(slot_mut.string.clone());
-                        slot_mut.string = JV_NULL.clone();
-                        jv_free(slot_mut.value.clone());
-                        slot_mut.value = JV_NULL.clone();
-                    }
-                    return 1;
-                }
+    let Some(bucket_idx) = jvp_object_find_bucket(object, key) else {
+        return 0;
+    };
+    let obj = unsafe { &mut *(object.u as *mut JvpObject) };
+    let mut curr_idx = obj.buckets[bucket_idx];
+    let mut prev_idx = -1;
+    while curr_idx >= 0 {
+        let slot_idx = curr_idx as usize;
+        let matches = {
+            let slot = &obj.elements[slot_idx];
+            jvp_object_slot_live(slot) && slot.hash == hash && jvp_string_equal(key, &slot.string)
+        };
+        if matches {
+            let next_idx = obj.elements[slot_idx].next;
+            if prev_idx < 0 {
+                obj.buckets[bucket_idx] = next_idx;
+            } else {
+                obj.elements[prev_idx as usize].next = next_idx;
             }
+            let string = std::mem::replace(&mut obj.elements[slot_idx].string, JV_NULL.clone());
+            jvp_string_free(string);
+            let value = std::mem::replace(&mut obj.elements[slot_idx].value, JV_NULL.clone());
+            jv_free(value);
+            obj.elements[slot_idx].next = -2;
+            return 1;
         }
+        prev_idx = curr_idx;
+        curr_idx = obj.elements[slot_idx].next;
     }
     0
 }
@@ -3064,6 +3066,7 @@ impl JvpObject {
             refcnt: 1,
             next_free: 0,
             elements,
+            buckets: vec![-1; size * 2],
         }
     }
 }

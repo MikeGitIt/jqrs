@@ -334,17 +334,14 @@ pub fn jv_set(mut t: Jv, k: Jv, v: Jv) -> Jv {
 }
 /// Compare two strings for sorting
 fn string_cmp(a: &Jv, b: &Jv) -> i32 {
-    let lena = jv_string_length_bytes(jv_copy(a));
-    let lenb = jv_string_length_bytes(jv_copy(b));
-    let minlen = lena.min(lenb) as usize;
     let str_a = jv_string_value(a);
     let str_b = jv_string_value(b);
     let bytes_a = str_a.as_bytes();
     let bytes_b = str_b.as_bytes();
-    let cmp_len = minlen.min(bytes_a.len()).min(bytes_b.len());
+    let cmp_len = bytes_a.len().min(bytes_b.len());
     let r = bytes_a[..cmp_len].cmp(&bytes_b[..cmp_len]);
     match r {
-        Ordering::Equal => lena - lenb,
+        Ordering::Equal => bytes_a.len() as i32 - bytes_b.len() as i32,
         Ordering::Less => -1,
         Ordering::Greater => 1,
     }
@@ -1033,7 +1030,9 @@ fn jv_object_iter_value(obj: &Jv, iter: i32) -> Jv {
     crate::jv::jv_object_iter_value(obj, iter)
 }
 fn jv_string_length_bytes(s: Jv) -> i32 {
-    crate::jv::jv_string_length_bytes(&s)
+    let len = crate::jv::jv_string_length_bytes(&s);
+    jv_free(s);
+    len
 }
 fn jv_string_length_codepoints(s: Jv) -> i32 {
     crate::jv::jv_string_length_codepoints(s)

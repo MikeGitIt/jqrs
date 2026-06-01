@@ -137,7 +137,6 @@ fn jq_util_input_read_more(state: &mut JqUtilInputState) -> bool {
             state.current_line = 0;
         }
     }
-    state.buf.fill(0);
     state.buf_valid_len = 0;
     if let Some(ref mut input) = state.current_input {
         let limit = state.buf.len().saturating_sub(1);
@@ -415,9 +414,11 @@ pub fn jq_util_input_next_input(state: &mut JqUtilInputState) -> Jv {
                 is_last = jq_util_input_read_more(state);
                 // Set the buffer on the parser using real jv_parser_set_buf
                 let buf_len = state.buf_valid_len;
-                let buf_copy = state.buf[..buf_len].to_vec();
-                if let Some(parser) = get_parser_mut(state) {
-                    jv_parser_set_buf(parser, &buf_copy, buf_len as i32, !is_last);
+                if let Some(mut parser_any) = state.parser.take() {
+                    if let Some(parser) = parser_any.downcast_mut::<ExtendedJvParser>() {
+                        jv_parser_set_buf(parser, &state.buf[..buf_len], buf_len as i32, !is_last);
+                    }
+                    state.parser = Some(parser_any);
                 }
             }
 

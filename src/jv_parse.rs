@@ -31,15 +31,23 @@
 //! - parser_reset:10998081246742294855:./src/jv_parse.c
 //! - parser_free:1329208380410055101:./src/jv_parse.c
 use std::fmt;
+use std::ptr::NonNull;
+use std::sync::OnceLock;
 use crate::jv::{Jv, JvKind, jv_array, jv_object, jv_array_append, jv_object_set, jv_array_length, jv_object_length, jv_free, jv_copy};
 use crate::jv_dtoa::DtoaContext;
 use crate::types::*;
+
+#[inline]
+fn debug_parser_enabled() -> bool {
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("DEBUG_PARSER").is_some())
+}
 
 /// Extended parser state that adds fields needed by jv_parse but not in types::JvParser
 /// This wraps the base JvParser with additional fields
 pub struct ExtendedJvParser {
     pub base: JvParser,
-    pub curr_buf: Option<Vec<u8>>,
+    pub curr_buf: Option<NonNull<u8>>,
     pub curr_buf_length: usize,
     pub curr_buf_pos: usize,
     pub curr_buf_is_partial: bool,
@@ -231,7 +239,7 @@ pub fn stream_seq_check_truncation(p: &ExtendedJvParser) -> i32 {
 /// Parse a token
 pub fn parse_token(p: &mut ExtendedJvParser, ch: u8) -> Presult {
     let class = classify(ch);
-    if std::env::var("DEBUG_PARSER").is_ok() {
+    if debug_parser_enabled() {
         eprintln!("DEBUG parse_token: ch='{}' ({:#04x}), class={:?}, state={:?}",
             ch as char, ch, class, p.base.state);
     }
@@ -605,58 +613,76 @@ fn utf8_encode(codepoint: u32, out: &mut Vec<u8>) -> usize {
 /// Process a found string token
 /// Returns None on success, Some(error_msg) on failure
 pub fn found_string(p: &mut ExtendedJvParser) -> Presult {
-    if std::env::var("DEBUG_PARSER").is_ok() {
+    if debug_parser_enabled() {
         eprintln!("DEBUG found_string: tokenpos={}, token={:?}",
             p.base.tokenpos,
             String::from_utf8_lossy(&p.base.tokenbuf[..p.base.tokenpos]));
     }
-    let mut out = Vec::with_capacity(p.base.tokenpos);
-    let mut i = 0;
+    let mut in_pos = 0;
+    let mut out_pos = 0;
     let end = p.base.tokenpos;
-    while i < end {
-        let c = p.base.tokenbuf[i];
-        i += 1;
+    while in_pos < end {
+        let c = p.base.tokenbuf[in_pos];
+        in_pos += 1;
         if c == b'\\' {
-            if i >= end {
+            if in_pos >= end {
                 p.base.error = Some(make_error(p, "Expected escape character at end of string", &[]));
                 return Presult::Error;
             }
-            let escape = p.base.tokenbuf[i];
-            i += 1;
+            let escape = p.base.tokenbuf[in_pos];
+            in_pos += 1;
             match escape {
-                b'\\' | b'"' | b'/' => out.push(escape),
-                b'b' => out.push(b'\x08'),
-                b'f' => out.push(b'\x0C'),
-                b't' => out.push(b'\t'),
-                b'n' => out.push(b'\n'),
-                b'r' => out.push(b'\r'),
+                b'\\' | b'"' | b'/' => {
+                    p.base.tokenbuf[out_pos] = escape;
+                    out_pos += 1;
+                }
+                b'b' => {
+                    p.base.tokenbuf[out_pos] = b'\x08';
+                    out_pos += 1;
+                }
+                b'f' => {
+                    p.base.tokenbuf[out_pos] = b'\x0C';
+                    out_pos += 1;
+                }
+                b't' => {
+                    p.base.tokenbuf[out_pos] = b'\t';
+                    out_pos += 1;
+                }
+                b'n' => {
+                    p.base.tokenbuf[out_pos] = b'\n';
+                    out_pos += 1;
+                }
+                b'r' => {
+                    p.base.tokenbuf[out_pos] = b'\r';
+                    out_pos += 1;
+                }
                 b'u' => {
-                    if i + 4 > end {
+                    if in_pos + 4 > end {
                         p.base.error = Some(make_error(p, "Invalid \\uXXXX escape", &[]));
                         return Presult::Error;
                     }
-                    let hexvalue = unhex4(&p.base.tokenbuf[i..]);
+                    let hexvalue = unhex4(&p.base.tokenbuf[in_pos..]);
                     if hexvalue < 0 {
                         p.base.error = Some(make_error(p, "Invalid characters in \\uXXXX escape", &[]));
                         return Presult::Error;
                     }
                     let mut codepoint = hexvalue as u32;
-                    i += 4;
+                    in_pos += 4;
                     if (0xD800..=0xDBFF).contains(&codepoint) {
-                        if i + 6 > end || p.base.tokenbuf[i] != b'\\'
-                            || p.base.tokenbuf[i + 1] != b'u'
+                        if in_pos + 6 > end || p.base.tokenbuf[in_pos] != b'\\'
+                            || p.base.tokenbuf[in_pos + 1] != b'u'
                         {
                             p.base.error = Some(make_error(p, "Invalid \\uXXXX\\uXXXX surrogate pair escape", &[]));
                             return Presult::Error;
                         }
-                        let surrogate = unhex4(&p.base.tokenbuf[i + 2..]);
+                        let surrogate = unhex4(&p.base.tokenbuf[in_pos + 2..]);
                         if surrogate < 0
                             || !(0xDC00..=0xDFFF).contains(&(surrogate as u32))
                         {
                             p.base.error = Some(make_error(p, "Invalid \\uXXXX\\uXXXX surrogate pair escape", &[]));
                             return Presult::Error;
                         }
-                        i += 6;
+                        in_pos += 6;
                         codepoint = 0x10000
                             + (((codepoint - 0xD800) << 10)
                                 | (surrogate as u32 - 0xDC00));
@@ -664,7 +690,29 @@ pub fn found_string(p: &mut ExtendedJvParser) -> Presult {
                     if codepoint > 0x10FFFF {
                         codepoint = 0xFFFD;
                     }
-                    utf8_encode(codepoint, &mut out);
+                    let mut encoded = [0u8; 4];
+                    let encoded_len = if codepoint < 0x80 {
+                        encoded[0] = codepoint as u8;
+                        1
+                    } else if codepoint < 0x800 {
+                        encoded[0] = (0xC0 | (codepoint >> 6)) as u8;
+                        encoded[1] = (0x80 | (codepoint & 0x3F)) as u8;
+                        2
+                    } else if codepoint < 0x10000 {
+                        encoded[0] = (0xE0 | (codepoint >> 12)) as u8;
+                        encoded[1] = (0x80 | ((codepoint >> 6) & 0x3F)) as u8;
+                        encoded[2] = (0x80 | (codepoint & 0x3F)) as u8;
+                        3
+                    } else {
+                        encoded[0] = (0xF0 | (codepoint >> 18)) as u8;
+                        encoded[1] = (0x80 | ((codepoint >> 12) & 0x3F)) as u8;
+                        encoded[2] = (0x80 | ((codepoint >> 6) & 0x3F)) as u8;
+                        encoded[3] = (0x80 | (codepoint & 0x3F)) as u8;
+                        4
+                    };
+                    p.base.tokenbuf[out_pos..out_pos + encoded_len]
+                        .copy_from_slice(&encoded[..encoded_len]);
+                    out_pos += encoded_len;
                 }
                 _ => {
                     p.base.error = Some(make_error(p, "Invalid escape", &[]));
@@ -676,11 +724,15 @@ pub fn found_string(p: &mut ExtendedJvParser) -> Presult {
                 p.base.error = Some(make_error(p, "Invalid string: control characters from U+0000 through U+001F must be escaped", &[]));
                 return Presult::Error;
             }
-            out.push(c);
+            p.base.tokenbuf[out_pos] = c;
+            out_pos += 1;
         }
     }
-    let s = String::from_utf8_lossy(&out).into_owned();
-    if let Some(_err) = value(p, Jv::string(&s)) {
+    let parsed = match std::str::from_utf8(&p.base.tokenbuf[..out_pos]) {
+        Ok(s) => crate::jv::jv_string_sized(s, out_pos),
+        Err(_) => crate::jv::jvp_string_copy_replace_bad(&p.base.tokenbuf[..out_pos]),
+    };
+    if let Some(_err) = value(p, parsed) {
         return Presult::Error;
     }
     p.base.tokenpos = 0;
@@ -1213,14 +1265,22 @@ pub fn jv_parser_set_buf(p: &mut ExtendedJvParser, buf: &[u8], length: i32, is_p
             break;
         }
     }
-    p.curr_buf = Some(buf_slice.to_vec());
+    // Mirrors jq's C parser: curr_buf is a borrowed pointer into the caller's
+    // buffer. The caller must not replace that buffer until it has been fully
+    // consumed; the assertion above enforces that contract.
+    let ptr = if buf_slice.is_empty() {
+        NonNull::dangling()
+    } else {
+        NonNull::new(buf_slice.as_ptr() as *mut u8).expect("slice pointer must be non-null")
+    };
+    p.curr_buf = Some(ptr);
     p.curr_buf_length = remaining;
     p.curr_buf_pos = 0;
     p.curr_buf_is_partial = is_partial;
 }
 /// Get next parsed value
 pub fn jv_parser_next(p: &mut ExtendedJvParser) -> Jv {
-    let debug = std::env::var("DEBUG_PARSER").is_ok();
+    let debug = debug_parser_enabled();
     if debug {
         eprintln!("DEBUG jv_parser_next: eof={}, curr_buf={:?}, buf_pos={}, buf_len={}",
             p.base.eof, p.curr_buf.is_some(), p.curr_buf_pos, p.curr_buf_length);
@@ -1247,11 +1307,10 @@ pub fn jv_parser_next(p: &mut ExtendedJvParser) -> Jv {
     let mut msg: Option<&'static str> = OK;
     let mut last_ch: u8 = 0;
     while msg.is_none() {
-        let buf = p.curr_buf.as_ref().unwrap();
         if p.curr_buf_pos >= p.curr_buf_length {
             break;
         }
-        let ch = buf[p.curr_buf_pos];
+        let ch = unsafe { *p.curr_buf.unwrap().as_ptr().add(p.curr_buf_pos) };
         p.curr_buf_pos += 1;
         last_ch = ch;
         if p.st == JvParserState::WaitingForRs {
@@ -1613,5 +1672,21 @@ impl ExtendedJvParser {
         if self.base.flags & (JV_PARSE_STREAMING as i32) != 0 {
             self.base.path = Jv::array();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_string_escape_decode_in_place() {
+        let value = jv_parse(r#""quote: \" slash: \\ line:\n tab:\t mu:\u03bc pair:\ud834\udd1e""#);
+        assert_eq!(jv_get_kind(&value), JvKind::String);
+        assert_eq!(
+            crate::jv::jv_string_value(&value).as_bytes(),
+            b"quote: \" slash: \\ line:\n tab:\t mu:\xce\xbc pair:\xf0\x9d\x84\x9e"
+        );
+        jv_free(value);
     }
 }

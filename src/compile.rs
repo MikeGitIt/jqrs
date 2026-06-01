@@ -182,6 +182,7 @@ pub struct OpcodeDesc {
 pub struct CfuncRef {
     pub index: usize,
     pub nargs: i32,
+    pub name: Option<&'static str>,
 }
 
 /// Opcode values matching C opcode_list.h order exactly
@@ -2193,9 +2194,13 @@ pub fn gen_cbinding(
 ) -> Block {
     for cfunc in 0..ncfunctions as usize {
         let mut inst = inst_new(CLOSURE_CREATE_C);
-        inst.imm = InstImmediate::Cfunc(Box::new(CfuncRef { index: cfunc, nargs: cfunctions[cfunc].nargs }));
-        if let Some(ref name) = cfunctions[cfunc].name {
-            inst.symbol = Some(name.clone());
+        inst.imm = InstImmediate::Cfunc(Box::new(CfuncRef {
+            index: cfunc,
+            nargs: cfunctions[cfunc].nargs,
+            name: cfunctions[cfunc].name,
+        }));
+        if let Some(name) = cfunctions[cfunc].name {
+            inst.symbol = Some(name.to_string());
         }
         inst.nformals = cfunctions[cfunc].nargs - 1;
         inst.any_unbound = 0;
@@ -2402,9 +2407,13 @@ pub fn compile(
                             .array_append(Jv::string(sym));
                     }
                     if let InstImmediate::Cfunc(ref cfunc_ref) = curr.imm {
-                        // CfuncRef contains index into cfunctions - no copy needed
-                        // The Cfunction already exists in the globals.cfunctions array
-                        let _ = cfunc_ref; // Used for validation only
+                        if let Some(slot) = globals.cfunctions.get_mut(idx as usize) {
+                            *slot = Cfunction {
+                                fptr: None,
+                                name: cfunc_ref.name,
+                                nargs: cfunc_ref.nargs,
+                            };
+                        }
                     }
                     curr.imm = InstImmediate::IntVal(idx);
                 }

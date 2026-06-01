@@ -181,7 +181,7 @@ pub struct CfuncRef {
 #[derive(Debug, Clone)]
 pub struct Cfunction {
     pub fptr: Option<CfunctionPtr>,
-    pub name: Option<String>,
+    pub name: Option<&'static str>,
     pub nargs: i32,
 }
 
@@ -1000,6 +1000,7 @@ pub struct JvpObject {
     pub refcnt: JvRefcnt,
     pub next_free: i32,
     pub elements: Vec<ObjectSlot>,
+    pub buckets: Vec<i32>,
 }
 
 // Originally defined in: jv

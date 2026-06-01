@@ -65,6 +65,7 @@ use crate::types::*;
 use crate::types::{Stack, StackPtr};
 use std::mem;
 use std::io::Write;
+use std::sync::OnceLock;
 use crate::bytecode::{
     Bytecode, bytecode_free,
 };
@@ -72,8 +73,10 @@ use crate::bytecode::{
 use crate::parser::jq_parse;
 use crate::compile::{compile, count_cfunctions, jv_mem_alloc, jv_mem_calloc};
 use crate::types::Block;
-use crate::jv::{jv_number_value, jv_invalid_get_msg, jv_invalid_with_msg};
-use crate::jv_aux::jv_keys;
+use crate::jv::{
+    jv_number_value, jv_invalid_get_msg, jv_invalid_with_msg, jv_object_iter,
+    jv_object_iter_key, jv_object_iter_next, jv_object_iter_valid, jv_object_iter_value,
+};
 use crate::builtin::builtins_bind;
 // Note: jv_free and jv_get_kind are defined locally in this file
 // Note: opcode_describe may not be exported or have different signature
@@ -82,6 +85,18 @@ use crate::builtin::builtins_bind;
 // Type aliases for lowercase C-style names used in stack functions
 type stack = Stack;
 type stack_ptr = StackPtr;
+
+#[inline]
+fn debug_exec_enabled() -> bool {
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("DEBUG_EXEC").is_some())
+}
+
+#[inline]
+fn debug_compile_enabled() -> bool {
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("DEBUG_COMPILE").is_some())
+}
 
 /// Trait for types that can provide mutable access to JqState
 /// This allows functions to work with both `&mut JqState<T>` and `&mut Option<Box<JqState<T>>>`
@@ -574,8 +589,9 @@ pub fn stack_popn<T>(jq: &mut JqState<T>) -> Jv {
 /// Check if the current path is intact (unchanged)
 pub fn path_intact<T>(jq: &JqState<T>, curr: Jv) -> bool {
     if jq.subexp_nest == 0 && jv_get_kind(&jq.path) == JvKind::Array {
-        jv_identical(curr, jq.value_at_path.clone())
+        jv_identical(curr, jv_copy(&jq.value_at_path))
     } else {
+        crate::jv::jv_free(curr);
         true
     }
 }
@@ -761,8 +777,7 @@ fn jv_get_kind(v: &Jv) -> JvKind {
 }
 /// Check if two jv values are identical
 pub fn jv_identical(a: Jv, b: Jv) -> bool {
-    // Jv doesn't have identical method, compare kind_flags and size
-    a.kind_flags == b.kind_flags && a.size == b.size && a.u == b.u
+    crate::jv::jv_identical(a, b) != 0
 }
 /// Initialize a stack structure
 ///
@@ -925,7 +940,7 @@ pub fn make_closure<T>(jq: &JqState<T>, pc: &[u16], pc_offset: &mut usize) -> Cl
     if idx & 0x1000 != 0 {
         // C: int subfn_idx = idx & ~ARG_NEWCLOSURE;
         let subfn_idx = (idx & !0x1000) as usize;
-        let debug = std::env::var("DEBUG_EXEC").is_ok();
+        let debug = debug_exec_enabled();
         if debug {
             eprintln!("make_closure: subfunction reference, subfn_idx={}", subfn_idx);
         }
@@ -1074,7 +1089,7 @@ pub fn jq_compile_args<T, J: JqStateAccess<T>>(jq: &mut J, _str: &str, args: Jv)
 }
 
 fn jq_compile_args_impl<T, J: JqStateAccess<T>>(jq: &mut J, program_str: &str, args: Jv) -> bool {
-    let debug = std::env::var("DEBUG_COMPILE").is_ok();
+    let debug = debug_compile_enabled();
     if debug { eprintln!("DEBUG: jq_compile_args_impl called with program={:?}", program_str); }
 
     let jq_inner = match jq.get_jq_state() {
@@ -1122,7 +1137,7 @@ fn jq_compile_args_impl<T, J: JqStateAccess<T>>(jq: &mut J, program_str: &str, a
     };
 
     // Parse the program
-    let debug = std::env::var("DEBUG_COMPILE").is_ok();
+    let debug = debug_compile_enabled();
     let mut program = Block::default();
     if debug { eprintln!("DEBUG: Parsing program: {:?}", program_str); }
     let parse_errors = jq_parse(&mut locations, &mut program);
@@ -1240,7 +1255,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
     // eprintln!("DEBUG jq_next: entering loop, halted={}, bc.is_some={}", jq_inner.halted, jq_inner.bc.is_some());
     // Main execution loop
     loop {
-        let debug = std::env::var("DEBUG_EXEC").is_ok();
+        let debug = debug_exec_enabled();
         if debug { eprintln!("LOOP TOP: curr_frame={} halted={}", jq_inner.curr_frame, jq_inner.halted); }
         if jq_inner.halted {
             if debug { eprintln!("LOOP: halted=true, returning invalid"); }
@@ -1248,9 +1263,9 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
         }
 
         // Get the bytecode from the current frame
-        let bc = match frame_current(jq_inner) {
+        let bc_ptr = match frame_current(jq_inner) {
             Some(frame) => match &frame.bc {
-                Some(bc) => bc.clone(),
+                Some(bc) => &**bc as *const Bytecode,
                 None => {
                     // eprintln!("DEBUG jq_next: frame.bc is None");
                     return Jv::invalid();
@@ -1261,13 +1276,14 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                 return Jv::invalid();
             }
         };
+        let bc = unsafe { &*bc_ptr };
 
         if pc_offset >= bc.code.len() {
             return Jv::invalid();
         }
 
         let mut opcode = bc.code[pc_offset];
-        if std::env::var("DEBUG_EXEC").is_ok() {
+        if debug_exec_enabled() {
             eprintln!("EXEC: pc={}, opcode={}, bc.code.len={}", pc_offset, opcode, bc.code.len());
         }
         let raising = !jv_is_valid(&jq_inner.error);
@@ -1307,7 +1323,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             LOADK => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
+                let debug = debug_exec_enabled();
                 let const_idx = bc.code[pc_offset] as i32;
                 pc_offset += 1;
                 if debug {
@@ -1383,7 +1399,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             PUSHK_UNDER => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
+                let debug = debug_exec_enabled();
                 let const_idx = bc.code[pc_offset] as i32;
                 pc_offset += 1;
                 if debug {
@@ -1551,7 +1567,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             INDEX | INDEX_OPT => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
+                let debug = debug_exec_enabled();
                 if debug { eprintln!("EXEC INDEX: stack before pop"); }
                 if let Some(t) = stack_pop(jq_inner) {
                     if debug { eprintln!("EXEC INDEX: t.kind={:?}", jv_get_kind(&t)); }
@@ -1731,7 +1747,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             op if op == on_backtrack(TRY_BEGIN) => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
+                let debug = debug_exec_enabled();
                 if debug { eprintln!("EXEC TRY_BEGIN backtrack: raising={}", raising); }
                 if !raising {
                     // EXP backtracked, backtrack more
@@ -1825,7 +1841,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             RET => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
+                let debug = debug_exec_enabled();
                 if debug { eprintln!("EXEC RET: about to pop, stk_top={}", jq_inner.stk_top); }
                 if let Some(value) = stack_pop(jq_inner) {
                     if debug { eprintln!("EXEC RET: popped value kind={:?}", jv_get_kind(&value)); }
@@ -1883,7 +1899,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
             }
 
             CALL_JQ | TAIL_CALL_JQ => {
-                let debug_call = std::env::var("DEBUG_EXEC").is_ok();
+                let debug_call = debug_exec_enabled();
                 if debug_call {
                     eprintln!("EXEC CALL_JQ: starting, pc_offset={}", pc_offset);
                 }
@@ -1935,7 +1951,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
 
             // EACH and EACH_OPT - iterate over arrays/objects
             EACH | EACH_OPT => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
+                let debug = debug_exec_enabled();
                 if debug { eprintln!("EXEC EACH: starting iteration"); }
                 if let Some(container) = stack_pop(jq_inner) {
                     // Check path integrity
@@ -1968,7 +1984,7 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
 
             // ON_BACKTRACK(EACH) and ON_BACKTRACK(EACH_OPT) - continue iteration
             on_bt_each if on_bt_each == on_backtrack(EACH) || on_bt_each == on_backtrack(EACH_OPT) => {
-                let debug = std::env::var("DEBUG_EXEC").is_ok();
+                let debug = debug_exec_enabled();
                 if debug { eprintln!("EXEC EACH backtrack: continuing iteration"); }
 
                 let idx_jv = stack_pop(jq_inner).unwrap_or_else(|| Jv::number(0.0));
@@ -1993,21 +2009,21 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                         (false, false, Jv::null(), Jv::null())
                     }
                 } else if container_kind == JvKind::Object {
-                    // For objects - use object iteration
                     if opcode == on_backtrack(EACH) || opcode == on_backtrack(EACH_OPT) {
-                        idx = if idx < 0 { 0 } else { idx + 1 };
+                        idx = if idx < 0 {
+                            jv_object_iter(&container)
+                        } else {
+                            jv_object_iter_next(&container, idx)
+                        };
                     }
-                    let keys = jv_keys(jv_copy(&container));
-                    let len = jv_array_length(&keys);
-                    let keep = idx < len;
-                    let last = idx == len - 1;
+                    let keep = jv_object_iter_valid(&container, idx);
                     if keep {
-                        let k = jv_array_get(jv_copy(&keys), idx);
-                        let v = jv_object_get(&container, jv_copy(&k));
-                        jv_free(keys);
+                        let next_idx = jv_object_iter_next(&container, idx);
+                        let last = !jv_object_iter_valid(&container, next_idx);
+                        let k = jv_object_iter_key(&container, idx);
+                        let v = jv_object_iter_value(&container, idx);
                         (keep, last, k, v)
                     } else {
-                        jv_free(keys);
                         (false, false, Jv::null(), Jv::null())
                     }
                 } else {
@@ -2082,24 +2098,33 @@ pub fn jq_next<T, J: JqStateAccess<T>>(jq: &mut J) -> Jv {
                     }
                 }
 
-                // Get function name from cfunc_names
-                let func_name = if let Some(ref bc_box) = jq_inner.bc {
-                    if let Some(ref globals) = bc_box.globals {
-                        let name = crate::jv::jv_array_get(globals.cfunc_names.copy(), cfunc_idx as i32);
-                        if name.get_kind() == JvKind::String {
-                            crate::jv::jv_string_value(&name).to_string()
+                let func_name = jq_inner
+                    .bc
+                    .as_ref()
+                    .and_then(|bc_box| bc_box.globals.as_ref())
+                    .and_then(|globals| globals.cfunctions.get(cfunc_idx))
+                    .and_then(|function| function.name);
+
+                let result = if let Some(name) = func_name {
+                    call_builtin(jq_inner, name, args)
+                } else {
+                    let name = if let Some(ref bc_box) = jq_inner.bc {
+                        if let Some(ref globals) = bc_box.globals {
+                            crate::jv::jv_array_get(globals.cfunc_names.copy(), cfunc_idx as i32)
                         } else {
-                            String::new()
+                            Jv::string("")
                         }
                     } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
+                        Jv::string("")
+                    };
+                    let result = if name.get_kind() == JvKind::String {
+                        call_builtin(jq_inner, crate::jv::jv_string_value(&name), args)
+                    } else {
+                        call_builtin(jq_inner, "", args)
+                    };
+                    crate::jv::jv_free(name);
+                    result
                 };
-
-                // Dispatch to builtin function
-                let result = call_builtin(jq_inner, &func_name, args);
 
                 if jv_is_valid(&result) {
                     stack_push(jq_inner, result);
@@ -2965,7 +2990,7 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
         "_equal" => {
             let a = if !args.is_empty() { args.remove(0) } else { Jv::null() };
             let b = if !args.is_empty() { args.remove(0) } else { Jv::null() };
-            if std::env::var("DEBUG_EXEC").is_ok() {
+            if debug_exec_enabled() {
                 eprintln!("DEBUG _equal: a.kind={:?} b.kind={:?}", jv_get_kind(&a), jv_get_kind(&b));
                 if jv_get_kind(&a) == JvKind::Object {
                     let keys = crate::jv_aux::jv_keys(jv_copy(&a));
@@ -3004,7 +3029,7 @@ fn call_builtin<T>(jq: &mut JqState<T>, name: &str, mut args: Vec<Jv>) -> Jv {
             }
             jv_free(input);
             let result = crate::builtin::binop_equal(a, b);
-            if std::env::var("DEBUG_EXEC").is_ok() {
+            if debug_exec_enabled() {
                 eprintln!("DEBUG _equal: result={:?}", jv_get_kind(&result));
             }
             result
@@ -3127,7 +3152,7 @@ fn jv_get(container: Jv, key: Jv) -> Jv {
 /// Make closure from bytecode pc
 /// C: static struct closure make_closure(struct jq_state* jq, uint16_t* pc)
 fn make_closure_from_pc<T>(jq: &JqState<T>, code: &[u16], pc_offset: &mut usize) -> Closure {
-    let debug = std::env::var("DEBUG_EXEC").is_ok();
+    let debug = debug_exec_enabled();
     // C: uint16_t level = *pc++;
     let level = code[*pc_offset] as i32;
     *pc_offset += 1;
@@ -3215,9 +3240,9 @@ pub fn frame_get_level_mut<T>(jq: &mut JqState<T>, level: i32) -> Option<&mut Fr
 /// Push a new frame
 /// C: static struct frame* frame_push(jq_state*, closure callee, uint16_t* argdef, int nargs)
 pub fn frame_push<T>(jq: &mut JqState<T>, cl: Closure, code: &[u16], argdef_offset: usize, nargs: i32) -> StackPtr {
-    let debug = std::env::var("DEBUG_EXEC").is_ok();
+    let debug = debug_exec_enabled();
     if debug { eprintln!("frame_push: entering, nargs={}", nargs); }
-    let bc = cl.bc.clone();
+    let bc = cl.bc;
     let env = cl.env;
     let frame_sz = if let Some(ref bc_ref) = bc {
         frame_size(bc_ref.as_ref())
@@ -3238,7 +3263,7 @@ pub fn frame_push<T>(jq: &mut JqState<T>, cl: Closure, code: &[u16], argdef_offs
         // Use ptr::write to avoid dropping uninitialized garbage
         unsafe {
             std::ptr::write(frame_ptr, Frame {
-                bc: bc.clone(),
+                bc,
                 env,
                 retdata: old_frame,
                 retaddr_offset: 0,
@@ -3248,7 +3273,7 @@ pub fn frame_push<T>(jq: &mut JqState<T>, cl: Closure, code: &[u16], argdef_offs
         if debug { eprintln!("frame_push: frame initialized"); }
         let frame = unsafe { &mut *frame_ptr };
         if debug { eprintln!("frame_push: checking frame.bc"); }
-        if let Some(ref bc_ref) = bc {
+        if let Some(ref bc_ref) = frame.bc {
             let num_entries = (bc_ref.nclosures + bc_ref.nlocals) as usize;
             if debug { eprintln!("frame_push: num_entries={} (nclosures={} nlocals={})", num_entries, bc_ref.nclosures, bc_ref.nlocals); }
             frame.entries = Vec::with_capacity(num_entries);
